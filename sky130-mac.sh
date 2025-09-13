@@ -33,32 +33,35 @@ ensure_path_now() {
 
 ensure_macports() {
   if command -v port >/dev/null 2>&1; then return; fi
+
   say "Installing MacPorts via official .pkg…"
-  swver=$(sw_vers -productVersion | cut -d. -f1,2)
-  # crude mapping for known pkg names (update if newer macOS comes out)
-  case "$swver" in
-    15.*) PKG="MacPorts-2.10.4-15-Sequoia.pkg" ;;
-    14.*) PKG="MacPorts-2.10.4-14-Sonoma.pkg" ;;
-    13.*) PKG="MacPorts-2.10.4-13-Ventura.pkg" ;;
-    12.*) PKG="MacPorts-2.10.4-12-Monterey.pkg" ;;
-    *)    PKG="MacPorts-2.10.4.tar.bz2" ;; # fallback (source build)
+  swver="$(sw_vers -productVersion)"
+  major="${swver%%.*}"
+
+  # Map macOS → correct MacPorts pkg. Force .pkg on modern macOS (no source fallback).
+  case "$major" in
+    15) PKG="MacPorts-2.10.4-15-Sequoia.pkg" ;;
+    14) PKG="MacPorts-2.10.4-14-Sonoma.pkg" ;;
+    13) PKG="MacPorts-2.10.4-13-Ventura.pkg" ;;
+    12) PKG="MacPorts-2.10.4-12-Monterey.pkg" ;;
+    *)
+      err "Unsupported macOS ($swver). Please install MacPorts manually from https://www.macports.org/install.php and run this script again."
+      exit 1
+      ;;
   esac
+
   mkdir -p "$WORKDIR"; cd "$WORKDIR"
-  if [[ "$PKG" == *.pkg ]]; then
-    curl -fsSL "https://distfiles.macports.org/MacPorts/$PKG" -o "$PKG"
-    sudo installer -pkg "$PKG" -target /
-  else
-    # fallback build from source if pkg not mapped
-    curl -fsSL "https://distfiles.macports.org/MacPorts/$PKG" -o "$PKG"
-    tar -xjf "$PKG"
-    cd MacPorts-*
-    ./configure --prefix="$MACPORTS_PREFIX"
-    make -j"$(sysctl -n hw.ncpu)"
-    sudo make install
-  fi
+  say "• Detected macOS $swver → using $PKG"
+  URL="https://distfiles.macports.org/MacPorts/$PKG"
+
+  # Download with retry and fail hard if it doesn’t exist
+  curl -fL --retry 3 --retry-delay 2 "$URL" -o "$PKG"
+  sudo installer -pkg "$PKG" -target /
+
   ensure_path_now
   sudo port -v selfupdate
 }
+
 
 ensure_xquartz() {
   if [[ -d "/Applications/XQuartz.app" || -d "/Applications/Utilities/XQuartz.app" ]]; then return; fi
