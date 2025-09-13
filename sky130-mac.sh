@@ -1,105 +1,111 @@
 #!/usr/bin/env bash
-# sky130-mac.sh — one-command macOS bootstrap + launcher for Magic + SKY130A
-# Usage (students):
-#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/<username>/<repo>/main/sky130-mac.sh)"
+# sky130-mac.sh — one-line macOS installer + launcher for Magic + Sky130
+# Usage for students:
+#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/sky130-mac.sh)"
 # Later:
-#   sky130            # launches Magic (installs missing bits automatically)
-#   sky130 --uninstall  # removes everything this script installed
+#   sky130          # launch Magic (GUI, sized sanely)
+#   sky130 --safe   # headless (no GUI), for batch/CI
 
 set -euo pipefail
 
 MACPORTS_PREFIX="/opt/local"
-PDK_ROOT="/opt/pdk"
-LAUNCHER="/usr/local/bin/sky130"
+PDK_PREFIX="/opt/pdk"                 # open_pdks --prefix
 WORKDIR="${HOME}/.eda-bootstrap"
 DEMO_DIR="${HOME}/sky130-demo"
+RC_DIR="${HOME}/.config/sky130"
+LAUNCHER="/usr/local/bin/sky130"
 
-say() { printf "\033[1;36m%s\033[0m\n" "$*"; }
+say()  { printf "\033[1;36m%s\033[0m\n" "$*"; }
 warn() { printf "\033[1;33m%s\033[0m\n" "$*"; }
-err() { printf "\033[1;31m%s\033[0m\n" "$*"; }
+err()  { printf "\033[1;31m%s\033[0m\n" "$*"; }
+
+ensure_path_now(){ export PATH="$MACPORTS_PREFIX/bin:$MACPORTS_PREFIX/sbin:$PATH"; }
 
 need_xcode() {
   if ! xcode-select -p >/dev/null 2>&1; then
-    say "Installing Xcode Command Line Tools (accept dialog if it pops up)…"
+    say "Installing Xcode Command Line Tools… (accept the Apple dialog)"
     xcode-select --install || true
-    err "Finish CLT install, then re-run the sky130 command."
+    err "Finish Command Line Tools, then re-run the one-liner."
     exit 1
   fi
-}
-
-ensure_path_now() {
-  export PATH="$MACPORTS_PREFIX/bin:$MACPORTS_PREFIX/sbin:$PATH"
 }
 
 ensure_macports() {
   if command -v port >/dev/null 2>&1; then return; fi
-
   say "Installing MacPorts via official .pkg…"
-  swver="$(sw_vers -productVersion)"
-  major="${swver%%.*}"
-
-  # Map macOS → correct MacPorts pkg. Force .pkg on modern macOS (no source fallback).
-  case "$major" in
-    15) PKG="MacPorts-2.10.4-15-Sequoia.pkg" ;;
-    14) PKG="MacPorts-2.10.4-14-Sonoma.pkg" ;;
-    13) PKG="MacPorts-2.10.4-13-Ventura.pkg" ;;
-    12) PKG="MacPorts-2.10.4-12-Monterey.pkg" ;;
-    *)
-      err "Unsupported macOS ($swver). Please install MacPorts manually from https://www.macports.org/install.php and run this script again."
-      exit 1
-      ;;
-  esac
-
   mkdir -p "$WORKDIR"; cd "$WORKDIR"
-  say "• Detected macOS $swver → using $PKG"
-  URL="https://distfiles.macports.org/MacPorts/$PKG"
-
-  # Download with retry and fail hard if it doesn’t exist
-  curl -fL --retry 3 --retry-delay 2 "$URL" -o "$PKG"
+  swmaj="$(sw_vers -productVersion | awk -F. '{print $1}')"
+  case "$swmaj" in
+    15) PKG="MacPorts-2.10.4-15-Sequoia.pkg" ;;
+    14) PKG="MacPorts-2.10.4-14-Sonoma.pkg"  ;;
+    13) PKG="MacPorts-2.10.4-13-Ventura.pkg" ;;
+    12) PKG="MacPorts-2.10.4-12-Monterey.pkg";;
+    *)  err "Unsupported macOS ($(sw_vers -productVersion)). Install MacPorts manually, then rerun."; exit 1;;
+  esac
+  curl -fL --retry 3 "https://distfiles.macports.org/MacPorts/${PKG}" -o "$PKG"
   sudo installer -pkg "$PKG" -target /
-
   ensure_path_now
   sudo port -v selfupdate
 }
 
-
 ensure_xquartz() {
   if [[ -d "/Applications/XQuartz.app" || -d "/Applications/Utilities/XQuartz.app" ]]; then return; fi
-  warn "Installing XQuartz…"
+  warn "XQuartz not found — fetching latest release…"
   mkdir -p "$WORKDIR"; cd "$WORKDIR"
   if curl -fsSL "https://api.github.com/repos/XQuartz/XQuartz/releases/latest" -o xq.json; then
-    PKG_URL=$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' xq.json)
+    PKG_URL="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' xq.json)"
   fi
   if [[ -z "${PKG_URL:-}" ]]; then
-    err "Could not auto-detect XQuartz pkg. Install manually from https://www.xquartz.org/"
+    err "Could not auto-detect XQuartz pkg. Install from https://www.xquartz.org/ and run this script again."
     exit 1
   fi
-  curl -fsSL "$PKG_URL" -o XQuartz.pkg
+  curl -fL "$PKG_URL" -o XQuartz.pkg
   sudo installer -pkg XQuartz.pkg -target /
 }
 
-ensure_tools() {
-  say "Installing Magic/Netgen/NGSpice via MacPorts…"
-  sudo port -N install git pkgconfig tcl tk magic netgen ngspice
+ports_install() {
+  say "Installing Magic/Netgen/NGSpice via MacPorts… (Magic uses +x11 for stability)"
+  # Ensure Tcl/Tk X11 and Magic X11 variant (avoid Quartz crashes on Sequoia)
+  sudo port -N upgrade --enforce-variants tk +x11        || sudo port -N install tk +x11
+  sudo port -N upgrade --enforce-variants magic +x11 -quartz || sudo port -N install magic +x11
+  sudo port -N install netgen ngspice git pkgconfig
 }
 
-ensure_pdk() {
-  if [[ -d "$PDK_ROOT/sky130A" ]]; then return; fi
-  say "Installing SKY130A PDK (open_pdks)…"
-  sudo mkdir -p "$PDK_ROOT"; sudo chown "$(id -u)":"$(id -g)" "$PDK_ROOT"
+choose_pdk() {
+  for base in "$PDK_PREFIX" "$PDK_PREFIX/share/pdk"; do
+    for name in sky130A sky130B; do
+      [[ -d "$base/$name" ]] && { printf "%s %s" "$base" "$name"; return 0; }
+    done
+  done
+  return 1
+}
+
+install_pdk() {
+  if choose_pdk >/dev/null; then return; fi
+  say "Installing Sky130 PDK via open_pdks…"
+  sudo mkdir -p "$PDK_PREFIX"; sudo chown "$(id -u)":"$(id -g)" "$PDK_PREFIX"
   mkdir -p "$WORKDIR"; cd "$WORKDIR"
-  if [[ -d open_pdks ]]; then cd open_pdks; git pull --rebase; else git clone https://github.com/RTimothyEdwards/open_pdks.git; cd open_pdks; fi
-  ./configure --prefix="$PDK_ROOT" --enable-sky130-pdk --with-sky130-local-path="$PDK_ROOT" --enable-sram-sky130
+  if [[ -d open_pdks/.git ]]; then
+    cd open_pdks && git pull --rebase
+  else
+    git clone https://github.com/RTimothyEdwards/open_pdks.git
+    cd open_pdks
+  fi
+  ./configure --prefix="$PDK_PREFIX" --enable-sky130-pdk --with-sky130-local-path="$PDK_PREFIX" --enable-sram-sky130
   make -j"$(sysctl -n hw.ncpu)"
   sudo make install
+  if ! choose_pdk >/dev/null; then
+    err "open_pdks finished but no sky130A/B found under $PDK_PREFIX. Check build output."
+    exit 1
+  fi
 }
 
-ensure_demo() {
+write_demo() {
   mkdir -p "$DEMO_DIR"
   cat > "$DEMO_DIR/inverter_tt.spice" <<'EOF'
 .option nomod
 .option scale=1e-6
-.lib $PDK_ROOT/sky130A/libs.tech/ngspice/sky130.lib.spice tt
+.lib $PDK_ROOT/${PDK}/libs.tech/ngspice/sky130.lib.spice tt
 VDD vdd 0 1.8
 VIN in  0 PULSE(0 1.8 0n 100p 100p 5n 10n)
 CL  out 0 10f
@@ -111,47 +117,117 @@ plot v(in) v(out)
 .endc
 .end
 EOF
+  cat > "$DEMO_DIR/smoke.tcl" <<'EOF'
+puts ">>> smoke: tech=[tech name]"
+quit -noprompt
+EOF
+}
+
+write_rc_wrapper() {
+  mkdir -p "$RC_DIR"
+  cat > "$RC_DIR/rc_wrapper.tcl" <<'EOF'
+# --- Load real PDK rc ---
+if {![info exists env(PDK_ROOT)]} { set env(PDK_ROOT) "/opt/pdk" }
+if {![info exists env(PDK)]}      { set env(PDK)      "sky130A" }
+source "$env(PDK_ROOT)/$env(PDK)/libs.tech/magic/${env(PDK)}.magicrc"
+
+# --- Sticky window sizing/positioning ---
+namespace eval ::sky130 {
+    variable tries 0
+    variable targetGeom "1400x900+80+60"
+}
+proc ::sky130::apply_geometry {} {
+    variable tries
+    variable targetGeom
+    catch { wm attributes . -zoomed 0 }
+    catch { wm attributes . -fullscreen 0 }
+    wm geometry . $targetGeom
+    set sw [winfo screenwidth .]
+    set sh [winfo screenheight .]
+    set maxw [expr {$sw - 120}]
+    set maxh [expr {$sh - 120}]
+    catch { wm maxsize . $maxw $maxh }
+    if {$tries < 1} { puts ">>> rc_wrapper.tcl: geometry $targetGeom (screen=${sw}x${sh})" }
+    incr tries
+    if {$tries < 3} { after 600 ::sky130::apply_geometry }
+}
+after 120 ::sky130::apply_geometry
+bind . <Map>        { after 100 ::sky130::apply_geometry }
+bind . <Visibility> { after 150 ::sky130::apply_geometry }
+
+after 200 {
+  catch { wm title . "Magic ($env(PDK)) — SKY130 Classroom" }
+  catch { if {[winfo exists .console]} { wm geometry .console "+40+40" } }
+}
+EOF
 }
 
 install_launcher() {
-  if [[ -x "$LAUNCHER" ]]; then return; fi
   say "Installing launcher: $LAUNCHER"
-  cat <<'EOF' | sudo tee "$LAUNCHER" >/dev/null
+  sudo tee "$LAUNCHER" >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-PDK_ROOT_DEFAULT="/opt/pdk"
-export PDK_ROOT="${PDK_ROOT:-$PDK_ROOT_DEFAULT}"
-export PDK="${PDK:-sky130A}"
-if ! pgrep -f XQuartz >/dev/null 2>&1; then open -a XQuartz || true; sleep 1; fi
-exec magic -T "$PDK" "$@"
+
+# Detect PDK (A/B; /opt/pdk or /opt/pdk/share/pdk)
+choose_pdk() {
+  for base in /opt/pdk /opt/pdk/share/pdk; do
+    for name in sky130A sky130B; do
+      [[ -d "$base/$name" ]] && { echo "$base" "$name"; return 0; }
+    done
+  done
+  return 1
+}
+read -r PDK_ROOT PDK < <(choose_pdk) || { echo "No SKY130 PDK found."; exit 1; }
+export PDK_ROOT PDK
+
+MAGIC_BIN="/opt/local/bin/magic"
+RC_WRAPPER="$HOME/.config/sky130/rc_wrapper.tcl"
+RC_PDK="$PDK_ROOT/$PDK/libs.tech/magic/${PDK}.magicrc"
+RC="$RC_PDK"; [[ -f "$RC_WRAPPER" ]] && RC="$RC_WRAPPER"
+
+# Start XQuartz if needed and set DISPLAY
+pgrep -f XQuartz >/dev/null 2>&1 || { open -a XQuartz || true; sleep 3; }
+export DISPLAY="${DISPLAY:-:0}"
+
+# Clean environment (avoid Conda/Homebrew pollution)
+CLEAN_ENV=(/usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK")
+
+echo ">>> sky130 launcher: using RC=$RC"
+
+# Headless mode
+if [[ "${1:-}" == "--safe" ]]; then
+  exec "${CLEAN_ENV[@]}" "$MAGIC_BIN" -norcfile -dnull -noconsole -T "$PDK" -rcfile "$RC" "${@:2}"
+fi
+
+# Single stable GUI path: X11 (no double-open)
+exec "${CLEAN_ENV[@]}" "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
 EOF
   sudo chmod +x "$LAUNCHER"
 }
 
-uninstall_all() {
-  say "Uninstalling SKY130 stack…"
-  sudo rm -f "$LAUNCHER"
-  rm -rf "$DEMO_DIR"
-  sudo rm -rf "$PDK_ROOT"
-  if command -v port >/dev/null 2>&1; then
-    sudo port -fp uninstall magic netgen ngspice || true
-  fi
-  say "✅ Uninstall complete."
-  exit 0
+headless_check() {
+  # Prove tech loads cleanly (prints '>>> smoke: tech=sky130A/B')
+  read -r PDK_BASE PDK_NAME < <(choose_pdk)
+  /usr/bin/env -i PATH="$MACPORTS_PREFIX/bin:$MACPORTS_PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME" DISPLAY=":0" PDK_ROOT="$PDK_BASE" PDK="$PDK_NAME" \
+    /opt/local/bin/magic -norcfile -dnull -noconsole -T "$PDK_NAME" \
+    -rcfile "$RC_DIR/rc_wrapper.tcl" "$DEMO_DIR/smoke.tcl"
 }
 
 main() {
-  if [[ "${1:-}" == "--uninstall" ]]; then uninstall_all; fi
   need_xcode
   ensure_macports
   ensure_path_now
   ensure_xquartz
-  ensure_tools
-  ensure_pdk
-  ensure_demo
+  ports_install
+  install_pdk
+  write_demo
+  write_rc_wrapper
   install_launcher
+  say "Running quick headless check…"
+  headless_check || true
   say "Launching Magic…"
-  "$LAUNCHER" || true
+  exec "$LAUNCHER"
 }
 
 main "$@"
