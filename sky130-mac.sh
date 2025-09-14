@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sky130-mac.sh — macOS one-liner installer for Magic+NGSpice+Netgen+xschem with Sky130 PDK
+# sky130-mac.sh — macOS one-liner installer for Magic + xschem + NGSpice + Netgen + Sky130 PDK
 # Usage:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/sky130-mac.sh)"
 # Launchers after install:
