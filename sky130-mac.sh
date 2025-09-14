@@ -196,8 +196,18 @@ EOF
 }
 
 install_magic_launcher() {
-  say "Installing Magic launcher: $MAGIC_LAUNCHER"
-  sudo tee "$MAGIC_LAUNCHER" >/dev/null <<'EOF'
+  say "Installing Magic launcher…"
+
+  # Pick a writable target dir, prefer /usr/local/bin, else /opt/local/bin
+  local target="/usr/local/bin/magic-sky130"
+  if ! sudo install -d -m 755 /usr/local/bin 2>/dev/null; then
+    warn "Could not create /usr/local/bin; falling back to /opt/local/bin."
+    sudo install -d -m 755 /opt/local/bin
+    target="/opt/local/bin/magic-sky130"
+  fi
+
+  # Write launcher
+  sudo tee "$target" >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk; do for n in sky130A sky130B; do [[ -d "$b/$n" ]]&&{ echo "$b" "$n"; return 0; }; done; done; return 1; }
@@ -207,8 +217,9 @@ MAGIC_BIN="/opt/local/bin/magic"
 RC_WRAPPER="$HOME/.config/sky130/rc_wrapper.tcl"
 RC_PDK="$PDK_ROOT/$PDK/libs.tech/magic/${PDK}.magicrc"
 RC="$RC_PDK"; [[ -f "$RC_WRAPPER" ]] && RC="$RC_WRAPPER"
+
+# Ensure XQuartz is up and DISPLAY is set
 pgrep -f XQuartz >/dev/null 2>&1 || { open -a XQuartz || true; sleep 3; }
-# Prefer launchd DISPLAY; fallback to :0
 LDISP="$(launchctl getenv DISPLAY || true)"
 if [ -z "${LDISP:-}" ]; then
   for d in /private/tmp/com.apple.launchd.*; do
@@ -216,6 +227,7 @@ if [ -z "${LDISP:-}" ]; then
   done
 fi
 export DISPLAY="${LDISP:-:0}"
+
 CLEAN_ENV=(/usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK")
 echo ">>> magic-sky130 launcher: using RC=$RC"
 if [[ "${1:-}" == "--safe" ]]; then
@@ -223,8 +235,16 @@ if [[ "${1:-}" == "--safe" ]]; then
 fi
 exec "${CLEAN_ENV[@]}" "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
 EOF
-  sudo chmod +x "$MAGIC_LAUNCHER"
+  sudo chmod +x "$target"
+
+  # If we fell back to /opt/local/bin but /usr/local/bin exists, add a convenience symlink
+  if [[ "$target" = "/opt/local/bin/magic-sky130" && -d /usr/local/bin ]]; then
+    sudo ln -sf "$target" /usr/local/bin/magic-sky130 || true
+  fi
+
+  say "Magic launcher installed at: $target"
 }
+
 
 write_spiceinit() {
   # Helpful NGSpice defaults (idempotent; harmless if ngspice not used)
