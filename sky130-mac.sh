@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# sky130-mac.sh — macOS one-liner installer for Magic + xschem + NGSpice + Netgen + Sky130 PDK
+# sky130-mac.sh — macOS one-liner for Magic + xschem + NGSpice + Netgen + Sky130 PDK
 # Usage:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/sky130-mac.sh)"
 # Launchers after install:
-#   magic-sky130           # Magic (GUI, stable X11 path, sized sanely)
-#   magic-sky130 --safe    # Magic headless
+#   magic-sky130           # Magic (GUI, X11, sized sanely)
+#   magic-sky130 --safe    # Magic (headless)
 #   xschem-sky130          # xschem (GUI)
 
 set -euo pipefail
@@ -31,8 +31,47 @@ need_xcode() {
   fi
 }
 
+fix_macports_signing() {
+  # Fix Sequoia Team-ID mismatch for MacPorts Tcl modules (tdbc et al.)
+  say "Applying MacPorts signing/quarantine fix (sudo)…"
+  sudo xattr -dr com.apple.quarantine /opt/local || true
+  to_sign=()
+  while IFS= read -r -d '' f; do to_sign+=("$f"); done < <(/usr/bin/find /opt/local/bin -maxdepth 1 -type f -name 'tclsh*' -print0)
+  while IFS= read -r -d '' f; do to_sign+=("$f"); done < <(/usr/bin/find /opt/local/libexec/macports/lib -type f -name '*.dylib' -print0)
+  while IFS= read -r -d '' f; do to_sign+=("$f"); done < <(/usr/bin/find /opt/local/lib -type f \( -name 'libtcl*.dylib' -o -name 'libtk*.dylib' \) -print0)
+  for f in "${to_sign[@]}"; do
+    sudo /usr/bin/codesign --force --sign - "$f" >/dev/null 2>&1 || true
+  done
+}
+
+macports_ok() {
+  /usr/bin/env -i PATH="$MACPORTS_PREFIX/bin:$MACPORTS_PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME" "$MACPORTS_PREFIX/bin/port" version >/dev/null 2>&1
+}
+
+reinstall_macports_source() {
+  say "Reinstalling MacPorts from source (sudo)…"
+  sudo rm -rf /opt/local /Applications/MacPorts /Library/Tcl/macports1.0 /Library/LaunchDaemons/org.macports.* 2>/dev/null || true
+  local ver="2.10.4"
+  mkdir -p "$WORKDIR"; cd "$WORKDIR"
+  curl -fL "https://distfiles.macports.org/MacPorts/MacPorts-$ver.tar.bz2" -o "MacPorts-$ver.tar.bz2"
+  tar xf "MacPorts-$ver.tar.bz2"
+  cd "MacPorts-$ver"
+  ./configure --prefix=/opt/local
+  make -j"$(sysctl -n hw.ncpu)"
+  sudo make install
+  ensure_path_now
+  sudo port -v selfupdate
+}
+
 ensure_macports() {
-  if command -v port >/dev/null 2>&1; then return; fi
+  if command -v port >/dev/null 2>&1; then
+    if ! macports_ok; then
+      fix_macports_signing
+      macports_ok || { warn "MacPorts still failing; rebuilding from source…"; reinstall_macports_source; }
+    fi
+    return
+  fi
   say "Installing MacPorts via official .pkg…"
   mkdir -p "$WORKDIR"; cd "$WORKDIR"
   swmaj="$(sw_vers -productVersion | awk -F. '{print $1}')"
@@ -46,7 +85,11 @@ ensure_macports() {
   curl -fL --retry 3 "https://distfiles.macports.org/MacPorts/${PKG}" -o "$PKG"
   sudo installer -pkg "$PKG" -target /
   ensure_path_now
-  sudo port -v selfupdate
+  # First try; if tdbc signing breaks, fix then retry
+  if ! sudo port -v selfupdate; then
+    fix_macports_signing
+    sudo port -v selfupdate || { warn "Selfupdate still failing; rebuilding from source…"; reinstall_macports_source; }
+  fi
 }
 
 ensure_xquartz() {
@@ -66,11 +109,10 @@ ensure_xquartz() {
 
 ports_install() {
   say "Installing EDA tools via MacPorts… (Magic uses +x11 for stability)"
-  # Force X11 Tk & Magic X11; then Netgen, NGSpice, xschem (+ xterm)
   sudo port -N upgrade --enforce-variants tk +x11             || sudo port -N install tk +x11
   sudo port -N upgrade --enforce-variants magic +x11 -quartz  || sudo port -N install magic +x11
   sudo port -N install netgen ngspice git pkgconfig
-  sudo port -N install xschem xterm || warn "xschem port not available in this catalog; skipping."
+  sudo port -N install xschem xterm || warn "xschem port not available; continuing without it."
 }
 
 choose_pdk() {
@@ -198,8 +240,9 @@ EOF
 }
 
 install_xschem_launcher() {
-  say "Installing xschem launcher: $XSCHEM_LAUNCHER"
-  sudo tee "$XSCHEM_LAUNCHER" >/dev/null <<'EOF'
+  if [[ -x /opt/local/bin/xschem ]]; then
+    say "Installing xschem launcher: $XSCHEM_LAUNCHER"
+    sudo tee "$XSCHEM_LAUNCHER" >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if   [ -d /opt/pdk/sky130A ];           then export PDK_ROOT=/opt/pdk;           export PDK=sky130A
@@ -211,7 +254,10 @@ pgrep -f XQuartz >/dev/null 2>&1 || { open -a XQuartz || true; sleep 2; }
 export DISPLAY="${DISPLAY:-:0}"
 exec /opt/local/bin/xschem "$@"
 EOF
-  sudo chmod +x "$XSCHEM_LAUNCHER"
+    sudo chmod +x "$XSCHEM_LAUNCHER"
+  else
+    warn "xschem binary not found after install; skipping launcher."
+  fi
 }
 
 write_spiceinit() {
@@ -249,7 +295,9 @@ main() {
   echo "Launchers:"
   echo "  • magic-sky130           (Magic GUI)"
   echo "  • magic-sky130 --safe    (Magic headless)"
-  echo "  • xschem-sky130          (xschem GUI)"
+  if [[ -x /opt/local/bin/xschem ]]; then
+    echo "  • xschem-sky130          (xschem GUI)"
+  fi
   echo
   echo "Demos:"
   echo "  • NGSpice demo: cd ~/sky130-demo && ngspice inverter_tt.spice"
