@@ -1,18 +1,10 @@
 #!/bin/sh
-# sky130_setup.sh — Minimal, robust Magic + SKY130 PDK installer with explicit verification
+# sky130_setup.sh — Minimal, robust Magic + SKY130 PDK installer with explicit verification + XQuartz auto-repair
 # macOS 12–15 (Monterey, Ventura, Sonoma, Sequoia). Intel & Apple Silicon.
-# Steps:
-# 1) Verify Xcode CLT
-# 2) Install/verify MacPorts (OS-aware)
-# 3) Install/verify XQuartz + X11
-# 4) Install/verify Magic (MacPorts)
-# 5) Install/verify SKY130 PDK (open_pdks)
-# 6) Install launchers
-# All actions logged. Short, precise errors echoed to screen.
 
 set -Eeuo pipefail
 
-### --- Config/paths ---
+# --- Config/paths ---
 MACPORTS_PREFIX="/opt/local"
 PORTCMD="$MACPORTS_PREFIX/bin/port"
 PDK_PREFIX="/opt/pdk"
@@ -34,12 +26,7 @@ say()  { printf "%s\n" "$*" >&3; }
 ok()   { printf "OK: %s\n" "$*" >&3; }
 err()  { printf "ERROR: %s\n" "$*" >&3; }
 section(){ printf "\n--- %s ---\n" "$*" >>"$LOG"; }
-
-on_fail() {
-  err "$1 (see log: $LOG)"
-  exit 1
-}
-
+on_fail() { err "$1 (see log: $LOG)"; exit 1; }
 os_major() { sw_vers -productVersion | awk -F. '{print $1}'; }
 
 xquartz_display() {
@@ -51,23 +38,70 @@ xquartz_display() {
   printf ':0\n'
 }
 
-### --- 1) Xcode CLT ---
+# --- New: robust XQuartz ensure/repair ---
+ensure_xquartz() {
+  section "XQuartz install/verify (self-healing)"
+  # helper to locate xset
+  set_xset() { XSET="/opt/X11/bin/xset"; [ -x "$XSET" ] || XSET="/usr/X11/bin/xset"; }
+  set_xset
+
+  install_pkg=false
+  if [ ! -x "$XSET" ] && [ ! -d "/Applications/XQuartz.app" ] && [ ! -d "/Applications/Utilities/XQuartz.app" ]; then
+    install_pkg=true
+  fi
+
+  if $install_pkg; then
+    say "Installing XQuartz…"
+    curl -fsSL https://api.github.com/repos/XQuartz/XQuartz/releases/latest -o "$WORKDIR/xq.json" >>"$LOG" 2>&1 || on_fail "Fetch XQuartz release info failed"
+    PKG_URL="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' "$WORKDIR/xq.json" || true)"
+    [ -n "$PKG_URL" ] || on_fail "XQuartz package URL not found"
+    curl -fL "$PKG_URL" -o "$WORKDIR/XQuartz.pkg" >>"$LOG" 2>&1 || on_fail "Download XQuartz failed"
+    sudo installer -pkg "$WORKDIR/XQuartz.pkg" -target / >>"$LOG" 2>&1 || on_fail "XQuartz installer failed"
+  fi
+
+  # De-quarantine & enable indirect GL; start once
+  sudo xattr -dr com.apple.quarantine /opt/X11 /Applications/XQuartz.app 2>/dev/null || true
+  defaults write org.xquartz.X11 enable_iglx -bool true >/dev/null 2>&1 || true
+  pkill -x XQuartz 2>/dev/null || true
+  open -ga XQuartz >>"$LOG" 2>&1 || true
+  sleep 5
+
+  set_xset
+  [ -x "$XSET" ] || on_fail "XQuartz appears not installed (/opt/X11/bin/xset missing)"
+
+  # Verify; if not responsive, repair (reset prefs, caches, auth) and retry once
+  if ! "$XSET" -q >>"$LOG" 2>&1; then
+    say "Repairing XQuartz (reset prefs/caches)…"
+    pkill -x XQuartz 2>/dev/null || true
+    defaults delete org.xquartz.X11 >>"$LOG" 2>&1 || true
+    rm -f "$HOME/Library/Preferences/org.xquartz.X11.plist" >>"$LOG" 2>&1 || true
+    rm -rf "$HOME/Library/Caches/org.xquartz.X11" >>"$LOG" 2>&1 || true
+    rm -f "$HOME/.Xauthority" "$HOME/.serverauth."* >>"$LOG" 2>&1 || true
+    sudo xattr -dr com.apple.quarantine /Applications/XQuartz.app /opt/X11 >>"$LOG" 2>&1 || true
+    open -ga XQuartz >>"$LOG" 2>&1 || true
+    sleep 5
+    "$XSET" -q >>"$LOG" 2>&1 || on_fail "X11 not responding via XQuartz after repair"
+  fi
+
+  /opt/X11/bin/xhost +SI:localuser:"$USER" >>"$LOG" 2>&1 || true
+  DISP="$(xquartz_display)"; export DISPLAY="$DISP"
+  ok "XQuartz/X11 OK (DISPLAY=$DISP)"
+}
+
+# --- 1) Xcode CLT ---
 section "Xcode CLT check"
 if xcode-select -p >>"$LOG" 2>&1; then
   ok "Xcode Command Line Tools present"
 else
   say "Requesting Xcode CLT…"
   if xcode-select --install >>"$LOG" 2>&1 || true; then
-    for i in $(seq 1 60); do
-      xcode-select -p >>"$LOG" 2>&1 && break
-      sleep 2
-    done
+    for i in $(seq 1 60); do xcode-select -p >>"$LOG" 2>&1 && break; sleep 2; done
   fi
   xcode-select -p >>"$LOG" 2>&1 || on_fail "Xcode CLT not installed. Run: xcode-select --install"
   ok "Xcode CLT installed"
 fi
 
-### --- 2) MacPorts install + verify ---
+# --- 2) MacPorts install + verify ---
 section "MacPorts install"
 if [ ! -x "$PORTCMD" ]; then
   case "$(os_major)" in
@@ -81,54 +115,28 @@ if [ ! -x "$PORTCMD" ]; then
   curl -fL --retry 3 "https://distfiles.macports.org/MacPorts/$PKG" -o "$WORKDIR/$PKG" >>"$LOG" 2>&1 || on_fail "Download MacPorts failed"
   sudo installer -pkg "$WORKDIR/$PKG" -target / >>"$LOG" 2>&1 || on_fail "MacPorts installer failed"
 fi
-# Verify
 section "MacPorts verify"
 sudo "$PORTCMD" -v selfupdate >>"$LOG" 2>&1 || on_fail "MacPorts selfupdate failed"
 "$PORTCMD" version >>"$LOG" 2>&1 || on_fail "MacPorts CLI missing after install"
 ok "MacPorts ready"
 
-### --- 3) XQuartz install + verify (X11 sanity) ---
-section "XQuartz install/verify"
-if [ ! -d "/Applications/XQuartz.app" ] && [ ! -d "/Applications/Utilities/XQuartz.app" ]; then
-  say "Installing XQuartz…"
-  curl -fsSL https://api.github.com/repos/XQuartz/XQuartz/releases/latest -o "$WORKDIR/xq.json" >>"$LOG" 2>&1 || on_fail "Fetch XQuartz release info failed"
-  PKG_URL="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' "$WORKDIR/xq.json" || true)"
-  [ -n "$PKG_URL" ] || on_fail "XQuartz package URL not found"
-  curl -fL "$PKG_URL" -o "$WORKDIR/XQuartz.pkg" >>"$LOG" 2>&1 || on_fail "Download XQuartz failed"
-  sudo installer -pkg "$WORKDIR/XQuartz.pkg" -target / >>"$LOG" 2>&1 || on_fail "XQuartz installer failed"
-fi
-defaults write org.xquartz.X11 enable_iglx -bool true >/dev/null 2>&1 || true
-# Bring up XQuartz + verify X11 responds
-open -ga XQuartz >>"$LOG" 2>&1 || true
-sleep 3
-DISP="$(xquartz_display)"; export DISPLAY="$DISP"
+# --- 3) XQuartz/X11 (self-healing) ---
+ensure_xquartz
 
-# Try both locations for xset (some setups expose /usr/X11/bin)
-XSET="/opt/X11/bin/xset"; [ -x "$XSET" ] || XSET="/usr/X11/bin/xset"
-if [ ! -x "$XSET" ]; then
-  on_fail "XQuartz appears not installed (/opt/X11/bin/xset missing). Reinstall XQuartz and rerun."
-fi
-"$XSET" -q >>"$LOG" 2>&1 || on_fail "X11 not responding via XQuartz"
-
-### --- 4) Magic install (MacPorts) + verify ---
+# --- 4) Magic install (MacPorts) + verify ---
 section "Magic install"
-# Ensure Tcl/Tk (+x11) first
 sudo "$PORTCMD" -N upgrade --enforce-variants tk +x11 >>"$LOG" 2>&1 || sudo "$PORTCMD" -N install tk +x11 >>"$LOG" 2>&1 || on_fail "Tk +x11 install failed"
-# Magic + EDA friends
 sudo "$PORTCMD" -N upgrade --enforce-variants magic +x11 -quartz >>"$LOG" 2>&1 || sudo "$PORTCMD" -N install magic +x11 >>"$LOG" 2>&1 || on_fail "Magic install failed"
 sudo "$PORTCMD" -N install ngspice netgen gawk wget tcl tk >>"$LOG" 2>&1 || on_fail "ngspice/netgen install failed"
 sudo "$PORTCMD" -N rev-upgrade >>"$LOG" 2>&1 || true
-# Verify magic binary
-MAGIC_BIN="$MACPORTS_PREFIX/bin/magic"
-[ -x "$MAGIC_BIN" ] || MAGIC_BIN="/usr/local/bin/magic"
+MAGIC_BIN="$MACPORTS_PREFIX/bin/magic"; [ -x "$MAGIC_BIN" ] || MAGIC_BIN="/usr/local/bin/magic"
 [ -x "$MAGIC_BIN" ] || on_fail "Magic binary not found after install"
 ok "Magic installed ($MAGIC_BIN)"
 
-### --- 5) SKY130 PDK install + verify ---
+# --- 5) SKY130 PDK install + verify ---
 section "SKY130 PDK (open_pdks)"
 sudo install -d -m 755 "$PDK_PREFIX" >>"$LOG" 2>&1 || true
 sudo chown "$(id -u)":"$(id -g)" "$PDK_PREFIX" >>"$LOG" 2>&1 || true
-
 if [ -d "$OPENPDKS_DIR/.git" ]; then
   (cd "$OPENPDKS_DIR" && git pull --rebase) >>"$LOG" 2>&1 || on_fail "open_pdks update failed"
 else
@@ -141,7 +149,6 @@ fi
   sudo make install
 ) >>"$LOG" 2>&1 || on_fail "open_pdks build/install failed"
 
-# Verify PDK files exist
 if [ -f "$PDK_PREFIX/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
   export PDK_ROOT="$PDK_PREFIX"; export PDK="sky130A"
 elif [ -f "$PDK_PREFIX/share/pdk/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
@@ -151,20 +158,17 @@ else
 fi
 ok "SKY130 PDK detected at $PDK_ROOT/$PDK"
 
-# Headless tech load to verify Magic+PDK together
 SMOKE="$WORKDIR/smoke.tcl"
 cat > "$SMOKE" <<'EOF'
 puts ">>> tech=[tech name]"
 quit -noprompt
 EOF
-"$MAGIC_BIN'notused'" >/dev/null 2>&1 || true  # dummy to satisfy shellcheck on quotes
 "$MAGIC_BIN" -norcfile -dnull -noconsole -T "$PDK" -rcfile "$PDK_ROOT/$PDK/libs.tech/magic/$PDK.magicrc" "$SMOKE" >>"$LOG" 2>&1 || on_fail "Magic failed to load SKY130 tech (headless)"
 grep -q ">>> tech=" "$LOG" || on_fail "Magic+PDK verification text missing"
 ok "Magic loads SKY130 tech (headless check passed)"
 
-### --- 6) RC wrapper + demo + launchers ---
+# --- 6) RC wrapper + demo + launchers ---
 section "RC & launchers"
-# Nice window behavior
 cat > "$RC_DIR/rc_wrapper.tcl" <<'EOF'
 if {![info exists env(PDK_ROOT)]} { set env(PDK_ROOT) "/opt/pdk" }
 if {![info exists env(PDK)]}      { set env(PDK)      "sky130A" }
@@ -172,7 +176,6 @@ source "$env(PDK_ROOT)/$env(PDK)/libs.tech/magic/${env(PDK)}.magicrc"
 after 200 { catch { wm title . "Magic ($env(PDK)) — SKY130" } }
 EOF
 
-# Demo SPICE
 cat > "$DEMO_DIR/inverter_tt.spice" <<'EOF'
 .option nomod
 .option scale=1e-6
@@ -191,7 +194,6 @@ EOF
 
 sudo install -d -m 755 /usr/local/bin >>"$LOG" 2>&1 || true
 
-# magic-sky130 launcher
 cat | sudo tee /usr/local/bin/magic-sky130 >/dev/null <<'EOF'
 #!/bin/sh
 set -eu
@@ -213,7 +215,6 @@ exec "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
 EOF
 sudo chmod +x /usr/local/bin/magic-sky130 >>"$LOG" 2>&1 || true
 
-# magic-sky130-xsafe launcher (software GL)
 cat | sudo tee /usr/local/bin/magic-sky130-xsafe >/dev/null <<'EOF'
 #!/bin/sh
 set -eu
@@ -240,9 +241,6 @@ exec "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
 EOF
 sudo chmod +x /usr/local/bin/magic-sky130-xsafe >>"$LOG" 2>&1 || true
 
-ok "Launchers installed"
-
-### --- Done ---
 say ""
 ok "Install complete."
 say "Log file: $LOG"
