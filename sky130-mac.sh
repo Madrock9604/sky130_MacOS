@@ -102,10 +102,13 @@ defaults write org.xquartz.X11 enable_iglx -bool true >/dev/null 2>&1 || true
 open -ga XQuartz >>"$LOG" 2>&1 || true
 sleep 3
 DISP="$(xquartz_display)"; export DISPLAY="$DISP"
-# X11 double-checks:
-if ! /opt/X11/bin/xset -q >>"$LOG" 2>&1; then on_fail "X11 not responding via XQuartz"; fi
-/opt/X11/bin/xhost +SI:localuser:"$USER" >>"$LOG" 2>&1 || true
-ok "XQuartz/X11 OK (DISPLAY=$DISP)"
+
+# Try both locations for xset (some setups expose /usr/X11/bin)
+XSET="/opt/X11/bin/xset"; [ -x "$XSET" ] || XSET="/usr/X11/bin/xset"
+if [ ! -x "$XSET" ]; then
+  on_fail "XQuartz appears not installed (/opt/X11/bin/xset missing). Reinstall XQuartz and rerun."
+fi
+"$XSET" -q >>"$LOG" 2>&1 || on_fail "X11 not responding via XQuartz"
 
 ### --- 4) Magic install (MacPorts) + verify ---
 section "Magic install"
