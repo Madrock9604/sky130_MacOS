@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sky130-magic-only.sh — Magic + XQuartz + Sky130 PDK with robust checks & XQuartz repair (macOS)
+# sky130-magic-only.sh — Magic + XQuartz + Sky130 PDK with robust checks & auto-repair (macOS)
 # Launchers after install:
 #   magic-sky130           # Magic GUI (via XQuartz, window sized sanely)
 #   magic-sky130 --safe    # Magic headless (no GUI)
@@ -100,6 +100,53 @@ repair_xquartz(){
 
   sudo xattr -dr com.apple.quarantine /Applications/XQuartz.app /opt/X11 || true
   xquartz_sanity
+}
+
+# --- Tk/Wish sanity + repair -------------------------------------------------
+tk_wish_sanity() {
+  # Ensure XQuartz is up and DISPLAY works
+  pgrep -x XQuartz >/dev/null || { open -ga XQuartz || true; sleep 4; }
+  local disp; disp="$(xquartz_display_value)"
+  export DISPLAY="$disp"
+  launchctl setenv DISPLAY "$disp" >/dev/null 2>&1 || true
+  /opt/X11/bin/xhost +SI:localuser:$USER >/dev/null 2>&1 || true
+
+  # Pick Wish from MacPorts
+  local WISH="/opt/local/bin/wish8.6"
+  [[ -x "$WISH" ]] || WISH="/opt/local/bin/wish8.7"
+  [[ -x "$WISH" ]] || return 1
+
+  # Minimal Tk script: show a tiny window briefly, then exit 0
+  ensure_dir "$WORKDIR"
+  cat > "$WORKDIR/tk_test.tcl" <<'TCL'
+package require Tk
+wm geometry . 200x80+120+120
+label .l -text "Tk/X11 OK"; pack .l
+after 400 { exit 0 }
+vwait forever
+TCL
+
+  "$WISH" "$WORKDIR/tk_test.tcl" >/dev/null 2>&1
+}
+
+repair_tk_wish() {
+  say "Repairing Tk/Wish (force +x11, re-sign libs)…"
+  local line
+  line="$(/opt/local/bin/port -qv installed tk 2>/dev/null | awk '/active/{print}')"
+  if [[ "$line" != *"+x11"* ]]; then
+    sudo /opt/local/bin/port -N -f uninstall tk || true
+    sudo /opt/local/bin/port -N install tk +x11
+  else
+    sudo /opt/local/bin/port -N upgrade --enforce-variants tk +x11 || sudo /opt/local/bin/port -N install tk +x11
+  fi
+
+  # Re-sign Tcl/Tk bits to dodge Sequoia TeamID mismatch
+  sudo xattr -dr com.apple.quarantine /opt/local || true
+  while IFS= read -r -d '' f; do
+    sudo /usr/bin/codesign --force --sign - "$f" >/dev/null 2>&1 || true
+  done < <(/usr/bin/find /opt/local -type f \( -name 'libtcl*.dylib' -o -name 'libtk*.dylib' -o -name 'tclsh*' -o -name 'wish*' \) -print0)
+
+  sudo /opt/local/bin/port -N rev-upgrade >/dev/null 2>&1 || true
 }
 
 # --- checks & installers -----------------------------------------------------
@@ -349,7 +396,7 @@ install_magic_launcher() {
 
   # Prefer /usr/local/bin; fall back to /opt/local/bin if needed.
   local target_dir="/usr/local/bin"
-  if ! sudo install -d -m 755 "$target_dir" 2>/devNull; then
+  if ! sudo install -d -m 755 "$target_dir" 2>/dev/null; then
     warn "Could not create $target_dir; falling back to /opt/local/bin."
     target_dir="/opt/local/bin"
     sudo install -d -m 755 "$target_dir"
@@ -457,6 +504,20 @@ main() {
   ensure_macports
   ensure_path_now
   ensure_xquartz
+
+  # Verify Tk/Wish; auto-repair once if it fails (prevents “wish quit unexpectedly”)
+  if tk_wish_sanity; then
+    mark_pass "Tk/Wish GUI sanity"
+  else
+    warn "Tk/Wish sanity failed; attempting repair…"
+    repair_tk_wish
+    if tk_wish_sanity; then
+      mark_pass "Tk/Wish repaired"
+    else
+      mark_fail "Tk/Wish" "Wish still crashing; see MacPorts tk and XQuartz"
+    fi
+  fi
+
   ports_install_magic
   install_pdk
   write_demo
