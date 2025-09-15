@@ -270,30 +270,53 @@ plot v(in) v(out)
 .end
 EOF
 
+  # ------- FIXED: Tk-safe rc_wrapper.tcl (no Tk commands unless Tk exists) ------
   cat > "${RC_DIR}/rc_wrapper.tcl" <<'EOF'
+# Tk-safe wrapper for Magic + SKY130
+# Only uses Tk commands (wm/bind/after/winfo) if Tk is available. Safe for headless (-dnull) runs.
 if {![info exists env(PDK_ROOT)]} { set env(PDK_ROOT) "/opt/pdk" }
 if {![info exists env(PDK)]}      { set env(PDK)      "sky130A" }
-source "$env(PDK_ROOT)/$env(PDK)/libs.tech/magic/${env(PDK)}.magicrc"
-namespace eval ::sky130 { variable tries 0; variable targetGeom "1400x900+80+60" }
-proc ::sky130::apply_geometry {} {
-    variable tries; variable targetGeom
-    catch { wm attributes . -zoomed 0 }
-    catch { wm attributes . -fullscreen 0 }
-    wm geometry . $targetGeom
-    set sw [winfo screenwidth .]; set sh [winfo screenheight .]
-    catch { wm maxsize . [expr {$sw-120}] [expr {$sh-120}] }
-    if {$tries < 1} { puts ">>> rc_wrapper.tcl: geometry $targetGeom (screen=${sw}x${sh})" }
-    incr tries
-    if {$tries < 3} { after 600 ::sky130::apply_geometry }
+
+set ::sky130::pdk_rc [file join $env(PDK_ROOT) $env(PDK) libs.tech magic "${env(PDK)}.magicrc"]
+if {[file exists $::sky130::pdk_rc]} {
+    source $::sky130::pdk_rc
+} else {
+    puts ">>> rc_wrapper.tcl: PDK rc not found at $::sky130::pdk_rc"
 }
-after 120 ::sky130::apply_geometry
-bind . <Map>        { after 100 ::sky130::apply_geometry }
-bind . <Visibility> { after 150 ::sky130::apply_geometry }
-after 200 {
-  catch { wm title . "Magic ($env(PDK)) — SKY130 Classroom" }
-  catch { if {[winfo exists .console]} { wm geometry .console "+40+40" } }
+
+namespace eval ::sky130 {
+    variable targetGeom "1400x900+80+60"
+}
+
+proc ::sky130::has_tk {} {
+    foreach c {wm bind after winfo} {
+        if {![llength [info commands $c]]} { return 0 }
+    }
+    return 1
+}
+
+if {[::sky130::has_tk]} {
+    # Defer geometry until the window exists.
+    after 120 {
+        catch { wm attributes . -zoomed 0 }
+        catch { wm attributes . -fullscreen 0 }
+        catch { wm geometry . $::sky130::targetGeom }
+        set sw [winfo screenwidth .]
+        set sh [winfo screenheight .]
+        catch { wm maxsize . [expr {$sw-120}] [expr {$sh-120}] }
+        catch { wm title . "Magic ($env(PDK)) — SKY130" }
+        catch { if {[winfo exists .console]} { wm geometry .console "+40+40" } }
+    }
+    # Light-touch reapply when the toplevel maps/changes visibility
+    if {[llength [info commands bind]]} {
+        bind . <Map>        { after 100 { catch { wm geometry . $::sky130::targetGeom } } }
+        bind . <Visibility> { after 150 { catch { wm geometry . $::sky130::targetGeom } } }
+    }
+} else {
+    puts ">>> rc_wrapper.tcl: Tk not available; running headless."
 }
 EOF
+  # ---------------------------------------------------------------------------
 
   ok "Demo + rc wrapper ready"
 }
