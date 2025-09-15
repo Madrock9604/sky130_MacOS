@@ -1,226 +1,317 @@
-# Save as sky130-mac.sh
-# Then:  chmod +x sky130-mac.sh && ./sky130-mac.sh
-
 #!/usr/bin/env bash
-# sky130-mac.sh — Magic + SKY130 on macOS (Monterey/Ventura/Sonoma/Sequoia)
-set -euo pipefail
+# sky130-mac.sh — macOS bootstrap for Magic + SKY130 PDK
+# - Verifies Xcode CLT
+# - Installs/repairs MacPorts (auto-picks correct .pkg for your macOS)
+# - Installs/repairs XQuartz & X11 (DISPLAY wiring, socket checks, prefs reset)
+# - Installs Magic (MacPorts, +x11 variant) and deps
+# - Installs SKY130 PDK via open_pdks into /opt/pdk
+# - Creates handy launchers: magic-sky130 and magic-sky130-xsafe
+# - Logs everything to ~/.eda-bootstrap/logs/install.<timestamp>.log
+#
+# Tested on macOS Monterey/Ventura/Sonoma/Sequoia (Intel + Apple Silicon)
 
+set -Eeuo pipefail
+
+### --- Globals & Paths ---
+MACPORTS_PREFIX="/opt/local"
+PDK_PREFIX="/opt/pdk"
 WORKDIR="${HOME}/.eda-bootstrap"
 LOGDIR="${WORKDIR}/logs"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-LOG="${LOGDIR}/install.${STAMP}.log"
-PDK_PREFIX="/opt/pdk"
-MACPORTS_PREFIX="/opt/local"
+TS="$(date +%Y%m%d-%H%M%S)"
+LOGFILE="${LOGDIR}/install.${TS}.log"
+RC_DIR="${HOME}/.config/sky130"
+DEMO_DIR="${HOME}/sky130-demo"
 
-mkdir -p "${LOGDIR}"
-exec > >(tee -a "${LOG}") 2>&1
-
-TOTAL_STEPS=11
+TOTAL_STEPS=9
 STEP=0
 
-bar() {
-  # Robust progress bar (no seq; safe with set -u)
-  local msg="${1:-}"
-  local width=30
-  local done=$(( STEP * width / TOTAL_STEPS ))
-  (( done < 0 )) && done=0
-  (( done > width )) && done=$width
-  local rest=$(( width - done ))
-  # Build bar
-  local hashes dots
-  hashes="$(printf '%*s' "${done}" '' | tr ' ' '#')"
-  dots="$(printf '%*s' "${rest}" '' | tr ' ' '.')"
-  printf "[%s%s] (%d/%d) %s\n" "${hashes}" "${dots}" "${STEP}" "${TOTAL_STEPS}" "${msg}"
-}
-next(){ STEP=$((STEP+1)); bar "$1"; }
-ok(){   printf "OK: %s\n" "$1"; }
-warn(){ printf "WARN: %s\n" "$1"; }
-die(){  printf "ERROR: %s\nSee log: %s\n" "$1" "$LOG"; exit 1; }
-say(){  printf -- "---- %s ----\n" "$1"; }
+mkdir -p "${LOGDIR}" "${RC_DIR}" "${DEMO_DIR}"
 
-echo
-say "Log file: ${LOG}"
+### --- Pretty printing & logging helpers ---
+say()  { printf "%s\n" "$*" | tee -a "${LOGFILE}"; }
+ok()   { printf "✔ %s\n" "$*" | tee -a "${LOGFILE}"; }
+warn() { printf "✱ %s\n" "$*" | tee -a "${LOGFILE}"; }
+die()  { printf "✖ %s\n" "$*" | tee -a "${LOGFILE}"; exit 1; }
+
+step() {
+  STEP=$((STEP+1))
+  printf "\n[%d/%d] %s\n" "${STEP}" "${TOTAL_STEPS}" "$*" | tee -a "${LOGFILE}"
+}
+
+run() {
+  # run "desc" cmd...
+  local desc="$1"; shift
+  printf "→ %s\n" "${desc}" | tee -a "${LOGFILE}"
+  {
+    printf "\n--- %s ---\n" "${desc}"
+    "$@"
+    rc=$?
+    printf "--- exit %s: %s ---\n" "${rc}" "${desc}"
+    exit "${rc}"
+  } >>"${LOGFILE}" 2>&1
+}
 
 ensure_path() {
+  # Avoid stomping user PATH, just make sure MacPorts/X11 are visible
   export PATH="${MACPORTS_PREFIX}/bin:${MACPORTS_PREFIX}/sbin:/opt/X11/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 }
 
-# --- Xcode CLT ---
-next "Check Xcode Command Line Tools"
-if xcode-select -p >/dev/null 2>&1; then
-  ok "Xcode CLT present: $(xcode-select -p)"
-else
-  warn "Xcode CLT missing. Opening installer dialog…"
-  xcode-select --install || true
-  for _ in $(seq 1 24); do
-    sleep 5
-    if xcode-select -p >/dev/null 2>&1; then ok "Xcode CLT installed"; break; fi
-  done
-  xcode-select -p >/dev/null 2>&1 || die "Xcode CLT not installed (accept Apple dialog, then rerun)."
-fi
+require_sudo() {
+  if ! sudo -vn >/dev/null 2>&1; then
+    say "Requesting sudo (needed for installers)…"
+    sudo -v || die "Cannot proceed without sudo."
+  fi
+}
 
-# --- MacPorts ---
-next "Install/Verify MacPorts"
-ensure_path
+### --- Xcode CLT ---
+check_xcode() {
+  step "Check Xcode Command Line Tools"
+  if xcode-select -p >/dev/null 2>&1; then
+    ok "Xcode CLT found: $(xcode-select -p)"
+  else
+    warn "Xcode CLT not found. Triggering Apple installer popup…"
+    run "xcode-select --install" xcode-select --install || true
+    if xcode-select -p >/dev/null 2>&1; then
+      ok "Xcode CLT installed"
+    else
+      die "Xcode CLT not installed. Open the popup, finish install, then re-run this script."
+    fi
+  fi
+}
+
+### --- MacPorts install/verify ---
+macos_pkg_suffix() {
+  # Prints the OS suffix used by MacPorts release PKGs
+  local maj
+  maj="$(sw_vers -productVersion | awk -F. '{print $1}')"
+  case "${maj}" in
+    12) echo "12-Monterey" ;;
+    13) echo "13-Ventura"  ;;
+    14) echo "14-Sonoma"   ;;
+    15) echo "15-Sequoia"  ;;
+    *)  die "Unsupported macOS $(sw_vers -productVersion). Need 12–15." ;;
+  esac
+}
 
 macports_ok() {
-  /usr/bin/env -i PATH="${MACPORTS_PREFIX}/bin:${MACPORTS_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HOME" "${MACPORTS_PREFIX}/bin/port" version >/dev/null 2>&1
+  /usr/bin/env -i PATH="${MACPORTS_PREFIX}/bin:${MACPORTS_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="${HOME}" "${MACPORTS_PREFIX}/bin/port" version >/dev/null 2>&1
 }
 
-if command -v port >/dev/null 2>&1 && macports_ok; then
-  ok "MacPorts CLI ready"
-else
-  osmaj="$(sw_vers -productVersion | awk -F. '{print $1}')"
-  case "${osmaj}" in
-    15) PKG="MacPorts-2.11.5-15-Sequoia.pkg" ;;
-    14) PKG="MacPorts-2.11.5-14-Sonoma.pkg" ;;
-    13) PKG="MacPorts-2.11.5-13-Ventura.pkg" ;;
-    12) PKG="MacPorts-2.11.5-12-Monterey.pkg" ;;
-    *) die "Unsupported macOS major version: $(sw_vers -productVersion)" ;;
-  esac
-  mkdir -p "${WORKDIR}"
-  say "Downloading MacPorts: ${PKG}"
-  curl -fL --retry 3 "https://distfiles.macports.org/MacPorts/${PKG}" -o "${WORKDIR}/${PKG}" || die "MacPorts download failed"
-  sudo installer -pkg "${WORKDIR}/${PKG}" -target / || die "MacPorts installer failed"
+install_macports() {
+  step "Install/Repair MacPorts"
   ensure_path
-fi
+  if command -v port >/dev/null 2>&1; then
+    if macports_ok; then
+      run "MacPorts selfupdate" sudo port -N -v selfupdate || true
+      ok "MacPorts present: $(port version | tr -d '\n')"
+      return
+    fi
+    warn "MacPorts is present but not working. Attempting repair via selfupdate…"
+    run "MacPorts repair selfupdate" sudo "${MACPORTS_PREFIX}/bin/port" -N -v selfupdate || true
+    if macports_ok; then ok "MacPorts repaired"; return; fi
+  fi
 
-sudo "${MACPORTS_PREFIX}/bin/port" -q selfupdate || die "MacPorts selfupdate failed"
-macports_ok || die "MacPorts not functional after install"
-ok "MacPorts ready"
+  require_sudo
+  mkdir -p "${WORKDIR}"
+  local os suf url fallback
+  suf="$(macos_pkg_suffix)"
+  # Try GitHub latest first
+  url="$(curl -fsSL https://api.github.com/repos/macports/macports-base/releases/latest \
+        | awk -F\" '/browser_download_url/ && /MacPorts-.*-'"${suf}"'\.pkg/ {print $4; exit}')"
+  # Fallback to a known recent version if GitHub API blocked
+  fallback="https://distfiles.macports.org/MacPorts/MacPorts-2.11.5-${suf}.pkg"
+  [ -n "${url}" ] || url="${fallback}"
 
-# --- XQuartz ensure/repair ---
-next "Ensure/Repair XQuartz + X11"
+  say "Downloading MacPorts pkg for ${suf}…"
+  run "Fetch MacPorts pkg" curl -fL "${url}" -o "${WORKDIR}/MacPorts-${suf}.pkg"
+  run "Install MacPorts" sudo installer -pkg "${WORKDIR}/MacPorts-${suf}.pkg" -target /
 
-_xq_app() {
-  if [ -d "/Applications/Utilities/XQuartz.app" ]; then printf '/Applications/Utilities/XQuartz.app\n'
-  elif [ -d "/Applications/XQuartz.app" ]; then printf '/Applications/XQuartz.app\n'
-  else printf '\n'; fi
+  ensure_path
+  run "MacPorts first selfupdate" sudo port -N -v selfupdate || true
+  if macports_ok; then
+    ok "MacPorts installed and responding: $(port version | tr -d '\n')"
+  else
+    die "MacPorts not functional after install. See ${LOGFILE}"
+  fi
 }
-_xq_pick_display() {
-  local LD
-  LD="$(launchctl getenv DISPLAY 2>/dev/null || true)"
-  if [ -n "${LD}" ] && [ -S "${LD}" ]; then printf '%s\n' "${LD}" && return 0; fi
+
+### --- XQuartz / X11 ensure & repair ---
+xq_app_path() {
+  if [ -d "/Applications/Utilities/XQuartz.app" ]; then
+    printf "/Applications/Utilities/XQuartz.app\n"
+  elif [ -d "/Applications/XQuartz.app" ]; then
+    printf "/Applications/XQuartz.app\n"
+  else
+    printf "\n"
+  fi
+}
+xq_socket() {
+  # return first live XQuartz socket; else empty
   for d in /private/tmp/com.apple.launchd.*; do
-    [ -S "$d/org.xquartz:0" ] && { printf '%s\n' "$d/org.xquartz:0"; return 0; }
+    [ -S "$d/org.xquartz:0" ] && { printf '%s\n' "$d/org.xquartz:0"; return; }
   done
-  printf ':0\n'
+  printf "\n"
 }
-xquartz_hard_reset() {
-  pkill -x XQuartz 2>/dev/null || true
+xq_display() {
+  local D
+  D="$(launchctl getenv DISPLAY 2>/dev/null || true)"
+  if [ -n "${D}" ]; then printf "%s\n" "${D}"; return; fi
+  D="$(xq_socket)"
+  if [ -n "${D}" ]; then printf "%s\n" "${D}"; return; fi
+  printf ":0\n"
+}
+xq_env_export() {
+  local D; D="$(xq_display)"
+  export DISPLAY="${D}"
+  launchctl setenv DISPLAY "${D}" >/dev/null 2>&1 || true
+}
+xquartz_running() { pgrep -x XQuartz >/dev/null 2>&1; }
+
+install_xquartz() {
+  require_sudo
+  local url
+  url="$(curl -fsSL https://api.github.com/repos/XQuartz/XQuartz/releases/latest \
+        | awk -F\" '/browser_download_url/ && /\.pkg/ {print $4; exit}')"
+  [ -n "${url}" ] || die "Could not determine XQuartz pkg URL."
+  say "Downloading XQuartz…"
+  run "Fetch XQuartz pkg" curl -fL "${url}" -o "${WORKDIR}/XQuartz.pkg"
+  run "Install XQuartz" sudo installer -pkg "${WORKDIR}/XQuartz.pkg" -target /
+}
+
+repair_xquartz() {
+  # a safe, minimal-but-effective repair: nuke prefs/cache + restart app, rewire DISPLAY
+  say "Repairing XQuartz/X11…"
+  run "Kill XQuartz" pkill -x XQuartz || true
   defaults delete org.xquartz.X11 >/dev/null 2>&1 || true
+  rm -f "${HOME}/Library/Preferences/org.xquartz.X11.plist" || true
+  rm -rf "${HOME}/Library/Caches/org.xquartz.X11" || true
   rm -f "${HOME}/.Xauthority" "${HOME}/.serverauth."* 2>/dev/null || true
-  rm -rf "${HOME}/Library/Caches/org.xquartz.X11" 2>/dev/null || true
-}
-ensure_xquartz() {
-  local APP="$(_xq_app)"
-  if [ -z "${APP}" ]; then
-    mkdir -p "${WORKDIR}"
-    # Try latest release from GitHub API
-    if curl -fsSL https://api.github.com/repos/XQuartz/XQuartz/releases/latest -o "${WORKDIR}/xq.json"; then
-      PKG_URL="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' "${WORKDIR}/xq.json" || true)"
-    fi
-    if [ -z "${PKG_URL:-}" ]; then
-      # Fallback to known stable (adjust if needed later)
-      PKG_URL="https://github.com/XQuartz/XQuartz/releases/download/XQuartz-2.8.5/XQuartz-2.8.5.pkg"
-    fi
-    say "Downloading XQuartz…"
-    curl -fL "${PKG_URL}" -o "${WORKDIR}/XQuartz.pkg" || return 1
-    sudo installer -pkg "${WORKDIR}/XQuartz.pkg" -target / || return 1
-    APP="$(_xq_app)"
-  fi
-
   defaults write org.xquartz.X11 enable_iglx -bool true >/dev/null 2>&1 || true
-  sudo xattr -dr com.apple.quarantine "${APP}" /opt/X11 >/dev/null 2>&1 || true
 
-  open -ga "${APP}" || true
+  # Relaunch and wire DISPLAY
+  open -ga XQuartz || true
   sleep 4
-  local DISP="$(_xq_pick_display)"; export DISPLAY="${DISP}"
-  launchctl setenv DISPLAY "${DISP}" >/dev/null 2>&1 || true
-  /opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
+  xq_env_export
+  /opt/X11/bin/xhost +SI:localuser:"${USER}" >/dev/null 2>&1 || true
+}
 
-  if /opt/X11/bin/xset -q >/dev/null 2>&1; then
-    ok "XQuartz running (DISPLAY=${DISPLAY})"
-    return 0
+ensure_xquartz() {
+  step "Ensure/Repair XQuartz & X11"
+  if [ -z "$(xq_app_path)" ] || [ ! -x "/opt/X11/bin/xset" ]; then
+    warn "XQuartz missing or incomplete; installing…"
+    install_xquartz
   fi
 
-  warn "XQuartz first launch failed; applying hard reset…"
-  xquartz_hard_reset
-  open -ga "${APP}" || true
-  sleep 5
-  DISP="$(_xq_pick_display)"; export DISPLAY="${DISP}"
-  launchctl setenv DISPLAY "${DISP}" >/dev/null 2>&1 || true
-  /opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
-
-  if /opt/X11/bin/xset -q >/dev/null 2>&1; then
-    ok "XQuartz repaired (DISPLAY=${DISPLAY})"
-    return 0
-  fi
-
-  launchctl kickstart -kp "gui/$UID/org.xquartz.X11" 2>/dev/null || true
+  # Start + sanity
+  open -ga XQuartz || true
   sleep 3
-  /opt/X11/bin/xset -q >/dev/null 2>&1 && { ok "XQuartz agent started (DISPLAY=${DISPLAY})"; return 0; }
+  xq_env_export
+  /opt/X11/bin/xhost +SI:localuser:"${USER}" >/dev/null 2>&1 || true
 
-  return 1
+  if ! /opt/X11/bin/xset -q >/dev/null 2>&1; then
+    warn "xset -q failed; attempting repair…"
+    repair_xquartz
+  fi
+
+  if /opt/X11/bin/xset -q >/dev/null 2>&1; then
+    ok "XQuartz/X11 OK (DISPLAY=$(xq_display))"
+  else
+    # One last attempt: full re-install + repair
+    warn "Deep repair: reinstall XQuartz and rewire DISPLAY…"
+    install_xquartz
+    repair_xquartz
+    if /opt/X11/bin/xset -q >/dev/null 2>&1; then
+      ok "XQuartz recovered (DISPLAY=$(xq_display))"
+    else
+      die "XQuartz could not open a display. Try logging out/in, then re-run. See ${LOGFILE}"
+    fi
+  fi
 }
 
-ensure_xquartz || die "XQuartz/X11 failed to start. Open XQuartz once from /Applications (accept prompts), then rerun."
-
-# --- Magic via MacPorts ---
-next "Install Magic (+x11)"
-ensure_path
-sudo port -N upgrade --enforce-variants tk +x11 >/dev/null 2>&1 || true
-sudo port -N install  --enforce-variants tk +x11
-sudo port -N upgrade --enforce-variants magic +x11 -quartz >/dev/null 2>&1 || true
-sudo port -N install  --enforce-variants magic +x11 -quartz
-MAGIC_BIN="$(command -v magic || true)"
-[ -x "${MAGIC_BIN:-/dev/null}" ] || die "Magic binary not found after MacPorts install"
-ok "Magic at ${MAGIC_BIN}"
-
-# --- Verify Magic headless ---
-next "Verify Magic (headless tech load)"
-"${MAGIC_BIN}" -v || true
-
-# --- SKY130 PDK via open_pdks ---
-next "Install SKY130 PDK (open_pdks)"
-mkdir -p "${WORKDIR}"
-cd "${WORKDIR}"
-if [ -d open_pdks/.git ]; then (cd open_pdks && git pull --rebase); else git clone https://github.com/RTimothyEdwards/open_pdks.git; fi
-cd open_pdks
-./configure --prefix="${PDK_PREFIX}" --enable-sky130-pdk --with-sky130-local-path="${PDK_PREFIX}" --enable-sram-sky130
-make -j"$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-sudo make install
-
-choose_pdk() {
-  for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do
-    for n in sky130A sky130B; do
-      [ -f "$b/$n/libs.tech/magic/${n}.magicrc" ] && { printf '%s %s\n' "$b" "$n"; return 0; }
-    done
-  done
-  return 1
+### --- MacPorts: install Magic (+x11) & deps ---
+ensure_port() {
+  # ensure_port <portname> [variants...]
+  local name="$1"; shift || true
+  if port installed "${name}" >/dev/null 2>&1; then
+    run "port upgrade --enforce-variants ${name} $*" sudo port -N upgrade --enforce-variants "${name}" "$@"
+  else
+    run "port install ${name} $*" sudo port -N install "${name}" "$@"
+  fi
 }
-if read -r PBASE PNAME <<<"$(choose_pdk)"; then
-  ok "SKY130 PDK found: ${PBASE}/${PNAME}"
-else
-  die "SKY130 PDK not detected after install"
-fi
 
-# Quick headless probe
-cat > "${WORKDIR}/smoke.tcl" <<'EOF'
-puts ">>> smoke: tech=[tech name]"
-quit -noprompt
+install_magic_ports() {
+  step "Install Magic (+x11) and tools via MacPorts"
+  ensure_path
+  run "Update ports tree" sudo port -N -v sync || true
+
+  # Ensure Tk & Magic are X11 builds (not quartz)
+  ensure_port tk +x11
+  ensure_port magic +x11
+
+  # Handy tools (optional)
+  run "Install common EDA tools" sudo port -N install ngspice netgen gawk wget tcl tk git || true
+
+  if command -v magic >/dev/null 2>&1; then
+    ok "Magic installed: $(magic -version 2>/dev/null | head -n1 || echo from MacPorts)"
+  else
+    die "Magic is not available on PATH after install."
+  fi
+}
+
+### --- SKY130 PDK via open_pdks ---
+install_pdk() {
+  step "Install SKY130 PDK (open_pdks → ${PDK_PREFIX})"
+  require_sudo
+  sudo install -d -m 755 "${PDK_PREFIX}"
+  sudo chown "$(id -u)":"$(id -g)" "${PDK_PREFIX}" || true
+
+  mkdir -p "${WORKDIR}"
+  cd "${WORKDIR}"
+
+  if [ -d open_pdks/.git ]; then
+    run "Update open_pdks" bash -lc "cd open_pdks && git pull --rebase"
+  else
+    run "Clone open_pdks" git clone https://github.com/RTimothyEdwards/open_pdks.git
+  fi
+
+  cd open_pdks
+  run "Configure open_pdks" ./configure \
+    --prefix="${PDK_PREFIX}" \
+    --enable-sky130-pdk \
+    --with-sky130-local-path="${PDK_PREFIX}" \
+    --enable-sram-sky130
+  run "Build open_pdks" make -j"$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  run "Install open_pdks" sudo make install
+
+  # Verify
+  if [ -f "${PDK_PREFIX}/sky130A/libs.tech/magic/sky130A.magicrc" ] || \
+     [ -f "${PDK_PREFIX}/share/pdk/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
+    ok "SKY130 PDK installed"
+  else
+    die "SKY130 PDK not detected under ${PDK_PREFIX}. See ${LOGFILE}"
+  fi
+}
+
+### --- Write rc wrapper + demo + launchers ---
+write_rc_and_demo() {
+  step "Write demo and rc wrapper"
+  cat > "${DEMO_DIR}/inverter_tt.spice" <<'EOF'
+.option nomod
+.option scale=1e-6
+.lib $PDK_ROOT/${PDK}/libs.tech/ngspice/sky130.lib.spice tt
+VDD vdd 0 1.8
+VIN in  0 PULSE(0 1.8 0n 100p 100p 5n 10n)
+CL  out 0 10f
+M1 out in 0  0  sky130_fd_pr__nfet_01v8 W=1.0 L=0.15
+M2 out in vdd vdd sky130_fd_pr__pfet_01v8 W=2.0 L=0.15
+.control
+tran 0.1n 50n
+plot v(in) v(out)
+.endc
+.end
 EOF
-/usr/bin/env -i PATH="${PATH}" HOME="${HOME}" PDK_ROOT="${PBASE}" PDK="${PNAME}" \
-  "${MAGIC_BIN}" -norcfile -dnull -noconsole -T "${PNAME}" "${WORKDIR}/smoke.tcl" >/dev/null 2>&1 \
-  && ok "Magic headless tech load OK" || warn "Magic headless tech load failed (see log)"
 
-# --- Demo + RC wrapper ---
-next "Write demo and rc wrapper"
-RC_DIR="${HOME}/.config/sky130"
-DEMO_DIR="${HOME}/sky130-demo"
-mkdir -p "${RC_DIR}" "${DEMO_DIR}"
-
-cat > "${RC_DIR}/rc_wrapper.tcl" <<'EOF'
+  cat > "${RC_DIR}/rc_wrapper.tcl" <<'EOF'
 if {![info exists env(PDK_ROOT)]} { set env(PDK_ROOT) "/opt/pdk" }
 if {![info exists env(PDK)]}      { set env(PDK)      "sky130A" }
 source "$env(PDK_ROOT)/$env(PDK)/libs.tech/magic/${env(PDK)}.magicrc"
@@ -245,101 +336,139 @@ after 200 {
 }
 EOF
 
-cat > "${DEMO_DIR}/inverter_tt.spice" <<'EOF'
-.option nomod
-.option scale=1e-6
-.lib $PDK_ROOT/${PDK}/libs.tech/ngspice/sky130.lib.spice tt
-VDD vdd 0 1.8
-VIN in  0 PULSE(0 1.8 0n 100p 100p 5n 10n)
-CL  out 0 10f
-M1 out in 0  0  sky130_fd_pr__nfet_01v8 W=1.0 L=0.15
-M2 out in vdd vdd sky130_fd_pr__pfet_01v8 W=2.0 L=0.15
-.control
-tran 0.1n 50n
-plot v(in) v(out)
-.endc
-.end
-EOF
-ok "Demo + rc written"
+  ok "Demo + rc wrapper ready"
+}
 
-# --- Launchers ---
-next "Install launchers"
-sudo install -d -m 755 /usr/local/bin
+install_launchers() {
+  step "Install launchers"
+  require_sudo
+  sudo install -d -m 755 /usr/local/bin
 
-cat | sudo tee /usr/local/bin/magic-sky130 >/dev/null <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+  sudo tee /usr/local/bin/magic-sky130 >/dev/null <<'EOF'
+#!/bin/sh
+set -eu
 choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do
   for n in sky130A sky130B; do [ -d "$b/$n" ] && { printf '%s %s\n' "$b" "$n"; return 0; }; done
 done; return 1; }
-if [ -d "/Applications/Utilities/XQuartz.app" ]; then APP="/Applications/Utilities/XQuartz.app"
-elif [ -d "/Applications/XQuartz.app" ]; then APP="/Applications/XQuartz.app"
-else APP=""; fi
-pgrep -x XQuartz >/dev/null 2>&1 || { [ -n "$APP" ] && open -ga "$APP" || true; sleep 3; }
-LD="$(launchctl getenv DISPLAY 2>/dev/null || true)"
-if [ -z "${LD:-}" ] || [ ! -S "${LD}" ]; then
-  for d in /private/tmp/com.apple.launchd.*; do [ -S "$d/org.xquartz:0" ] && { LD="$d/org.xquartz:0"; break; }; done
-  : "${LD:=:0}"
-  export DISPLAY="$LD"; launchctl setenv DISPLAY "$LD" >/dev/null 2>&1 || true
+# Ensure XQuartz is running and DISPLAY wired
+pgrep -x XQuartz >/dev/null 2>&1 || { open -ga XQuartz || true; sleep 3; }
+LDISP="$(launchctl getenv DISPLAY 2>/dev/null || true)"
+if [ -z "${LDISP:-}" ]; then
+  for d in /private/tmp/com.apple.launchd.*; do [ -S "$d/org.xquartz:0" ] && { LDISP="$d/org.xquartz:0"; break; }; done
 fi
+export DISPLAY="${LDISP:-:0}"
 /opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
-MAGIC_BIN="$(command -v magic || true)"; [ -x "${MAGIC_BIN:-}" ] || { echo "magic not found"; exit 1; }
-read PDK_ROOT PDK <<<"$(choose_pdk || true)"; [ -n "${PDK_ROOT:-}" ] || { echo "No SKY130 PDK found"; exit 1; }
+
+MAGIC_BIN="/opt/local/bin/magic"; [ -x "$MAGIC_BIN" ] || MAGIC_BIN="/usr/local/bin/magic"
+[ -x "$MAGIC_BIN" ] || { echo "magic binary not found"; exit 1; }
+
+read PDK_ROOT PDK <<EOF2
+$(choose_pdk || true)
+EOF2
+[ -n "${PDK_ROOT:-}" ] || { echo "No SKY130 PDK found under /opt or /usr/local"; exit 1; }
+
 RC_WRAPPER="$HOME/.config/sky130/rc_wrapper.tcl"
 RC_PDK="$PDK_ROOT/$PDK/libs.tech/magic/${PDK}.magicrc"
 RC="$RC_PDK"; [ -f "$RC_WRAPPER" ] && RC="$RC_WRAPPER"
-exec /usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK" "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
-EOF
-sudo chmod +x /usr/local/bin/magic-sky130
 
-cat | sudo tee /usr/local/bin/magic-sky130-xsafe >/dev/null <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do
-  for n in sky130A sky130B; do [ -d "$b/$n" ] && { printf '%s %s\n' "$b" "$n"; return 0; }; done
-done; return 1; }
-if [ -d "/Applications/Utilities/XQuartz.app" ]; then APP="/Applications/Utilities/XQuartz.app"
-elif [ -d "/Applications/XQuartz.app" ]; then APP="/Applications/XQuartz.app"
-else APP=""; fi
+exec /usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+  HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
+  DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK" \
+  "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
+EOF
+  sudo chmod +x /usr/local/bin/magic-sky130
+
+  sudo tee /usr/local/bin/magic-sky130-xsafe >/dev/null <<'EOF'
+#!/bin/sh
+set -eu
 defaults write org.xquartz.X11 enable_iglx -bool true >/dev/null 2>&1 || true
 pkill -x XQuartz 2>/dev/null || true
-[ -n "$APP" ] && open -ga "$APP" || true
+open -ga XQuartz || true
 sleep 4
-LD="$(launchctl getenv DISPLAY 2>/dev/null || true)"
-if [ -z "${LD:-}" ] || [ ! -S "${LD}" ]; then
-  for d in /private/tmp/com.apple.launchd.*; do [ -S "$d/org.xquartz:0" ] && { LD="$d/org.xquartz:0"; break; }; done
-  : "${LD:=:0}"
-  export DISPLAY="$LD"; launchctl setenv DISPLAY "$LD" >/dev/null 2>&1 || true
+LDISP="$(launchctl getenv DISPLAY 2>/dev/null || true)"
+if [ -z "${LDISP:-}" ]; then
+  for d in /private/tmp/com.apple.launchd.*; do [ -S "$d/org.xquartz:0" ] && { LDISP="$d/org.xquartz:0"; break; }; done
 fi
+export DISPLAY="${LDISP:-:0}"
 /opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
-MAGIC_BIN="$(command -v magic || true)"; [ -x "${MAGIC_BIN:-}" ] || { echo "magic not found"; exit 1; }
-read PDK_ROOT PDK <<<"$(choose_pdk || true)"; [ -n "${PDK_ROOT:-}" ] || { echo "No SKY130 PDK found"; exit 1; }
+export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+
+choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do
+  for n in sky130A sky130B; do [ -d "$b/$n" ] && { printf '%s %s\n' "$b" "$n"; return 0; }; done
+done; return 1; }
+
+MAGIC_BIN="/opt/local/bin/magic"; [ -x "$MAGIC_BIN" ] || MAGIC_BIN="/usr/local/bin/magic"
+[ -x "$MAGIC_BIN" ] || { echo "magic binary not found"; exit 1; }
+
+read PDK_ROOT PDK <<EOF2
+$(choose_pdk || true)
+EOF2
+[ -n "${PDK_ROOT:-}" ] || { echo "No SKY130 PDK found"; exit 1; }
+
 RC_WRAPPER="$HOME/.config/sky130/rc_wrapper.tcl"
 RC_PDK="$PDK_ROOT/$PDK/libs.tech/magic/${PDK}.magicrc"
 RC="$RC_PDK"; [ -f "$RC_WRAPPER" ] && RC="$RC_WRAPPER"
-export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
-exec /usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
+
+exec /usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+  HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
+  DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+  "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
 EOF
-sudo chmod +x /usr/local/bin/magic-sky130-xsafe
-ok "Launchers installed"
+  sudo chmod +x /usr/local/bin/magic-sky130-xsafe
 
-# --- Final GUI probe ---
-next "Quick GUI probe"
-APP="$(_xq_app || true)"
-[ -n "${APP}" ] && open -ga "${APP}" || true
-sleep 2
-/opt/X11/bin/xset -q >/dev/null 2>&1 || warn "X server didn't answer to xset (GUI may still come up)"
-command -v magic-sky130 >/dev/null 2>&1 && ok "Try: magic-sky130  (or: magic-sky130-xsafe)"
+  ok "Launchers installed (magic-sky130, magic-sky130-xsafe)"
+}
 
-# --- Summary ---
-next "Done"
-echo
-say "Install complete"
-echo "Log: ${LOG}"
-echo "Launch:"
-echo "  • magic-sky130           (GUI via X11)"
-echo "  • magic-sky130-xsafe     (GUI with software OpenGL)"
-echo
-echo "SPICE demo:"
-echo "  cd \"${HOME}/sky130-demo\" && ngspice inverter_tt.spice"
-echo
+### --- Headless sanity check (tech load) ---
+magic_headless_check() {
+  step "Headless sanity check (Magic loads SKY130 tech)"
+  local MP RCFILE PBASE PNAME
+  MP="$(command -v magic || true)"
+  [ -x "${MP:-/dev/null}" ] || die "magic not found on PATH"
+
+  # find PDK
+  if [ -f "${PDK_PREFIX}/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
+    PBASE="${PDK_PREFIX}"; PNAME="sky130A"
+  elif [ -f "${PDK_PREFIX}/share/pdk/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
+    PBASE="${PDK_PREFIX}/share/pdk"; PNAME="sky130A"
+  else
+    die "SKY130 PDK rc not found after install."
+  fi
+
+  RCFILE="${RC_DIR}/rc_wrapper.tcl"
+  echo 'puts ">>> smoke: tech=[tech name]"; quit -noprompt' > "${WORKDIR}/smoke.tcl"
+
+  /usr/bin/env -i PATH="${PATH}" HOME="${HOME}" PDK_ROOT="${PBASE}" PDK="${PNAME}" \
+    "${MP}" -norcfile -dnull -noconsole -T "${PNAME}" -rcfile "${RCFILE}" "${WORKDIR}/smoke.tcl" \
+    >>"${LOGFILE}" 2>&1 || true
+
+  if grep -q ">>> smoke: tech=" "${LOGFILE}"; then
+    ok "Magic loaded tech '${PNAME}' (headless)"
+  else
+    die "Magic headless tech check failed. See ${LOGFILE}"
+  fi
+}
+
+### --- MAIN ---
+main() {
+  say "---- Log file: ${LOGFILE} ----"
+  ensure_path
+  check_xcode
+  install_macports
+  ensure_xquartz
+  install_magic_ports
+  install_pdk
+  write_rc_and_demo
+  install_launchers
+  magic_headless_check
+
+  say ""
+  ok "All done 🎉"
+  say "Launch Magic:"
+  say "  • magic-sky130           # normal GUI"
+  say "  • magic-sky130-xsafe     # GUI with software GL (safer on finicky GPUs)"
+  say ""
+  say "Logs saved to: ${LOGFILE}"
+  say "Demo:  cd \"${DEMO_DIR}\" && ngspice inverter_tt.spice"
+}
+main "$@"
