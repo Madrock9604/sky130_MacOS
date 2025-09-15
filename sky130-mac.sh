@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sky130-magic-only.sh — Magic + XQuartz + Sky130 PDK with robust checks (macOS, arm64/x86_64)
+# sky130-magic-only.sh — Magic + XQuartz + Sky130 PDK with robust checks & XQuartz repair (macOS)
 # Launchers after install:
 #   magic-sky130           # Magic GUI (via XQuartz, window sized sanely)
 #   magic-sky130 --safe    # Magic headless (no GUI)
@@ -55,6 +55,51 @@ pdk_loc(){
     done
   done
   return 1
+}
+
+# --- XQuartz helpers/repair --------------------------------------------------
+xquartz_display_value(){
+  local ld; ld="$(launchctl getenv DISPLAY || true)"
+  if [[ -n "$ld" ]]; then echo "$ld"; return 0; fi
+  for d in /private/tmp/com.apple.launchd.*; do
+    [[ -S "$d/org.xquartz:0" ]] && { echo "$d/org.xquartz:0"; return 0; }
+  done
+  echo ":0"
+}
+
+xquartz_sanity(){
+  # Start XQuartz, set DISPLAY, test xset -q. Returns 0 on success.
+  pgrep -x XQuartz >/dev/null || { open -ga XQuartz || true; sleep 4; }
+  local disp; disp="$(xquartz_display_value)"
+  export DISPLAY="$disp"
+  launchctl setenv DISPLAY "$disp" >/dev/null 2>&1 || true
+  /opt/X11/bin/xhost +SI:localuser:$USER >/dev/null 2>&1 || true
+  /opt/X11/bin/xset -q >/dev/null 2>&1
+}
+
+repair_xquartz(){
+  say "Repairing XQuartz (reset prefs, reinstall, de-quarantine)…"
+  pkill -x XQuartz 2>/dev/null || true
+  sleep 1
+  defaults delete org.xquartz.X11  >/dev/null 2>&1 || true
+  rm -f  "$HOME/Library/Preferences/org.xquartz.X11.plist"        || true
+  rm -rf "$HOME/Library/Caches/org.xquartz.X11"                    || true
+  rm -f  "$HOME/.Xauthority" "$HOME/.serverauth."*                 || true
+
+  if command -v brew >/dev/null 2>&1; then
+    brew uninstall --cask xquartz >/dev/null 2>&1 || true
+    brew install   --cask xquartz
+  else
+    ensure_dir "$WORKDIR"; cd "$WORKDIR" || return 1
+    curl -fsSL https://api.github.com/repos/XQuartz/XQuartz/releases/latest -o xq.json || return 1
+    local pkg; pkg="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' xq.json || true)"
+    [[ -n "$pkg" ]] || return 1
+    curl -fL "$pkg" -o XQuartz.pkg || return 1
+    sudo installer -pkg XQuartz.pkg -target / || return 1
+  fi
+
+  sudo xattr -dr com.apple.quarantine /Applications/XQuartz.app /opt/X11 || true
+  xquartz_sanity
 }
 
 # --- checks & installers -----------------------------------------------------
@@ -154,23 +199,34 @@ ensure_macports() {
 
 ensure_xquartz() {
   say "Ensuring XQuartz…"
+  local have=false
   if [[ -d "/Applications/XQuartz.app" || -d "/Applications/Utilities/XQuartz.app" ]]; then
-    mark_pass "XQuartz app present"
-    return
-  fi
-  ensure_dir "$WORKDIR"; cd "$WORKDIR" || exit 1
-  local PKG_URL=""
-  if curl -fsSL "https://api.github.com/repos/XQuartz/XQuartz/releases/latest" -o xq.json; then
-    PKG_URL="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' xq.json)"
-  fi
-  if [[ -z "$PKG_URL" ]]; then
-    mark_fail "XQuartz" "Could not auto-detect pkg URL"
-    return
-  fi
-  if curl -fL "$PKG_URL" -o XQuartz.pkg && sudo installer -pkg XQuartz.pkg -target /; then
-    mark_pass "XQuartz installed"
+    have=true
   else
-    mark_fail "XQuartz" "Installer failed"
+    ensure_dir "$WORKDIR"; cd "$WORKDIR" || exit 1
+    local PKG_URL=""
+    if curl -fsSL "https://api.github.com/repos/XQuartz/XQuartz/releases/latest" -o xq.json; then
+      PKG_URL="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' xq.json)"
+    fi
+    if [[ -n "$PKG_URL" ]] && curl -fL "$PKG_URL" -o XQuartz.pkg && sudo installer -pkg XQuartz.pkg -target /; then
+      have=true
+    fi
+  fi
+
+  if ! $have; then
+    mark_fail "XQuartz" "App not installed"; return
+  fi
+
+  # Try a quick GUI sanity check; if it fails, do a repair pass once.
+  if xquartz_sanity; then
+    mark_pass "XQuartz running (DISPLAY=$(xquartz_display_value))"
+  else
+    warn "XQuartz sanity check failed; attempting repair…"
+    if repair_xquartz && xquartz_sanity; then
+      mark_pass "XQuartz repaired and running"
+    else
+      mark_fail "XQuartz" "Repair failed; GUI may crash"
+    fi
   fi
 }
 
@@ -293,7 +349,7 @@ install_magic_launcher() {
 
   # Prefer /usr/local/bin; fall back to /opt/local/bin if needed.
   local target_dir="/usr/local/bin"
-  if ! sudo install -d -m 755 "$target_dir" 2>/dev/null; then
+  if ! sudo install -d -m 755 "$target_dir" 2>/devNull; then
     warn "Could not create $target_dir; falling back to /opt/local/bin."
     target_dir="/opt/local/bin"
     sudo install -d -m 755 "$target_dir"
