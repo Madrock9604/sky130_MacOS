@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# sky130-magic-only.sh — Magic + XQuartz + Sky130 PDK (MacPorts) with robust sanity checks
+# sky130-magic-only.sh — Magic + XQuartz + Sky130 PDK with robust checks (macOS, arm64/x86_64)
 # Launchers after install:
-#   magic-sky130           # Magic (GUI via XQuartz)
-#   magic-sky130 --safe    # Magic (headless)
+#   magic-sky130           # Magic GUI (via XQuartz, window sized sanely)
+#   magic-sky130 --safe    # Magic headless (no GUI)
 
 set -uo pipefail
 
+# --- constants/dirs ---------------------------------------------------------
 MACPORTS_PREFIX="/opt/local"
 PDK_PREFIX="/opt/pdk"
 WORKDIR="${HOME}/.eda-bootstrap"
 DEMO_DIR="${HOME}/sky130-demo"
 RC_DIR="${HOME}/.config/sky130"
+HEADLESS_LOG="${WORKDIR}/magic_headless.log"
 
 PASS=()
 FAIL=()
 
+# --- pretty printers ---------------------------------------------------------
 say()  { printf "\033[1;36m%s\033[0m\n" "$*"; }
 ok()   { printf "\033[1;32m%s\033[0m\n" "✔ $*"; }
 warn() { printf "\033[1;33m%s\033[0m\n" "⚠ $*"; }
@@ -23,6 +26,7 @@ err()  { printf "\033[1;31m%s\033[0m\n" "✖ $*"; }
 mark_pass(){ PASS+=("$1"); ok "$1"; }
 mark_fail(){ FAIL+=("$1 — $2"); err "$1 — $2"; }
 
+# --- helpers -----------------------------------------------------------------
 ensure_dir() {
   # ensure_dir <path> [sudo]
   local d="$1"; local need_sudo="${2:-}"
@@ -33,17 +37,38 @@ ensure_dir() {
   fi
 }
 
+ensure_path_now(){ export PATH="$MACPORTS_PREFIX/bin:$MACPORTS_PREFIX/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"; }
+
+# Presence detectors
+magic_path(){
+  if [[ -x /opt/local/bin/magic ]]; then echo /opt/local/bin/magic; return 0; fi
+  if [[ -x /usr/local/bin/magic ]]; then echo /usr/local/bin/magic; return 0; fi
+  return 1
+}
+
+pdk_loc(){
+  for base in "/opt/pdk" "/opt/pdk/share/pdk" "/usr/local/share/pdk"; do
+    for name in sky130A sky130B; do
+      if [[ -f "$base/$name/libs.tech/magic/${name}.magicrc" ]]; then
+        echo "$base $name"; return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# --- checks & installers -----------------------------------------------------
 need_xcode() {
   say "Checking Xcode Command Line Tools…"
   if xcode-select -p >/dev/null 2>&1; then
     mark_pass "Xcode Command Line Tools present"
   else
-    say "Prompting install of Command Line Tools…"
+    say "Prompting install of Command Line Tools… (accept Apple dialog)"
     xcode-select --install || true
     if xcode-select -p >/dev/null 2>&1; then
       mark_pass "Xcode Command Line Tools installed"
     else
-      mark_fail "Xcode Command Line Tools" "Not installed. Accept Apple's installer dialog, then re-run."
+      mark_fail "Xcode Command Line Tools" "Not installed. Finish Apple installer, then re-run."
     fi
   fi
 }
@@ -51,7 +76,9 @@ need_xcode() {
 fix_macports_signing() {
   say "Applying MacPorts signing/quarantine fix (Sequoia)…"
   sudo xattr -dr com.apple.quarantine /opt/local 2>/dev/null || true
-  while IFS= read -r -d '' f; do sudo /usr/bin/codesign --force --sign - "$f" >/dev/null 2>&1 || true; done < <(/usr/bin/find /opt/local -type f \( -name 'tclsh*' -o -name '*.dylib' \) -print0)
+  while IFS= read -r -d '' f; do
+    sudo /usr/bin/codesign --force --sign - "$f" >/dev/null 2>&1 || true
+  done < <(/usr/bin/find /opt/local -type f \( -name 'tclsh*' -o -name '*.dylib' \) -print0)
 }
 
 macports_ok() {
@@ -62,7 +89,7 @@ reinstall_macports_source() {
   say "Installing MacPorts from source (bulletproof)…"
   sudo rm -rf /opt/local /Applications/MacPorts /Library/Tcl/macports1.0 /Library/LaunchDaemons/org.macports.* 2>/dev/null || true
   local ver="2.10.4"
-  ensure_dir "$WORKDIR"; cd "$WORKDIR"
+  ensure_dir "$WORKDIR"; cd "$WORKDIR" || exit 1
   curl -fL "https://distfiles.macports.org/MacPorts/MacPorts-$ver.tar.bz2" -o "MacPorts-$ver.tar.bz2" || return 1
   tar xf "MacPorts-$ver.tar.bz2" || return 1
   cd "MacPorts-$ver" || return 1
@@ -72,6 +99,7 @@ reinstall_macports_source() {
 
 ensure_macports() {
   say "Ensuring MacPorts…"
+  ensure_path_now
   if command -v port >/dev/null 2>&1; then
     if macports_ok; then
       sudo port -v selfupdate >/dev/null 2>&1 || true
@@ -92,7 +120,7 @@ ensure_macports() {
   fi
 
   # Install via .pkg (then fix if needed)
-  ensure_dir "$WORKDIR"; cd "$WORKDIR"
+  ensure_dir "$WORKDIR"; cd "$WORKDIR" || exit 1
   local swmaj; swmaj="$(sw_vers -productVersion | awk -F. '{print $1}')"
   local PKG=""
   case "$swmaj" in
@@ -104,6 +132,7 @@ ensure_macports() {
   esac
   say "Installing MacPorts (${PKG})…"
   if curl -fL --retry 3 "https://distfiles.macports.org/MacPorts/${PKG}" -o "$PKG" && sudo installer -pkg "$PKG" -target /; then
+    ensure_path_now
     if sudo /opt/local/bin/port -v selfupdate >/dev/null 2>&1; then
       mark_pass "MacPorts installed"
     else
@@ -129,7 +158,7 @@ ensure_xquartz() {
     mark_pass "XQuartz app present"
     return
   fi
-  ensure_dir "$WORKDIR"; cd "$WORKDIR"
+  ensure_dir "$WORKDIR"; cd "$WORKDIR" || exit 1
   local PKG_URL=""
   if curl -fsSL "https://api.github.com/repos/XQuartz/XQuartz/releases/latest" -o xq.json; then
     PKG_URL="$(awk -F\" '/"browser_download_url":/ && /\.pkg"/ {print $4; exit}' xq.json)"
@@ -146,55 +175,60 @@ ensure_xquartz() {
 }
 
 ports_install_magic() {
-  say "Installing Magic (+x11) via MacPorts…"
+  say "Checking Magic…"
+  if MAGIC_BIN="$(magic_path)"; then
+    mark_pass "Magic present at ${MAGIC_BIN}"
+    return
+  fi
+
+  say "Installing Magic via MacPorts (+x11)…"
   local ok_all=true
   sudo port -N upgrade --enforce-variants tk +x11 >/dev/null 2>&1 || sudo port -N install tk +x11 >/dev/null 2>&1 || ok_all=false
   sudo port -N upgrade --enforce-variants magic +x11 -quartz >/dev/null 2>&1 || sudo port -N install magic +x11 >/dev/null 2>&1 || ok_all=false
-  # Optional helpers
   sudo port -N install ngspice netgen >/dev/null 2>&1 || true
-  if $ok_all && [[ -x /opt/local/bin/magic ]]; then
-    mark_pass "Magic installed"
+
+  if MAGIC_BIN="$(magic_path)"; then
+    mark_pass "Magic installed at ${MAGIC_BIN}"
   else
     mark_fail "Magic" "MacPorts install failed"
   fi
 }
 
 install_pdk() {
-  say "Installing Sky130 PDK (open_pdks)…"
+  say "Checking Sky130 PDK…"
+  if read -r PDK_BASE PDK_NAME < <(pdk_loc); then
+    mark_pass "Sky130 PDK present at ${PDK_BASE}/${PDK_NAME}"
+    return
+  fi
+
+  say "Installing Sky130 PDK via open_pdks…"
   ensure_dir "$PDK_PREFIX" sudo
   sudo chown "$(id -u)":"$(id -g)" "$PDK_PREFIX" || true
-  ensure_dir "$WORKDIR"; cd "$WORKDIR"
+  ensure_dir "$WORKDIR"; cd "$WORKDIR" || exit 1
+
   if [[ -d open_pdks/.git ]]; then
     (cd open_pdks && git pull --rebase >/dev/null 2>&1)
   else
-    git clone https://github.com/RTimothyEdwards/open_pdks.git >/dev/null 2>&1 || { mark_fail "Sky130 PDK" "git clone failed"; return; }
+    git clone https://github.com/RTimothyEdwards/open_pdks.git >/dev/null 2>&1 || {
+      mark_fail "Sky130 PDK" "git clone failed"; return; }
   fi
+
   cd open_pdks || { mark_fail "Sky130 PDK" "open_pdks dir missing"; return; }
+
+  # helpful deps (ignore errors if already present)
+  sudo port -N install git gawk wget tcl tk >/dev/null 2>&1 || true
+
   if ./configure --prefix="$PDK_PREFIX" --enable-sky130-pdk --with-sky130-local-path="$PDK_PREFIX" --enable-sram-sky130 >/dev/null 2>&1 \
      && make -j"$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)" >/dev/null 2>&1 \
      && sudo make install >/dev/null 2>&1; then
     :
-  else
-    mark_fail "Sky130 PDK" "open_pdks build/install failed"
-    return
   fi
 
-  # Detect A or B and presence of magic rc
-  local found=""
-  for base in "$PDK_PREFIX" "$PDK_PREFIX/share/pdk"; do
-    for name in sky130A sky130B; do
-      if [[ -f "$base/$name/libs.tech/magic/${name}.magicrc" ]]; then
-        found="$base/$name"
-        break
-      fi
-    done
-    [[ -n "$found" ]] && break
-  done
-
-  if [[ -n "$found" ]]; then
-    mark_pass "Sky130 PDK installed ($(basename "$found"))"
+  # Final detection (pass if present, even if build printed warnings)
+  if read -r PDK_BASE PDK_NAME < <(pdk_loc); then
+    mark_pass "Sky130 PDK installed at ${PDK_BASE}/${PDK_NAME}"
   else
-    mark_fail "Sky130 PDK" "No sky130A/B with magicrc found under $PDK_PREFIX"
+    mark_fail "Sky130 PDK" "open_pdks build/install failed; no sky130A/B found under /opt or /usr/local"
   fi
 }
 
@@ -256,6 +290,8 @@ EOF
 
 install_magic_launcher() {
   say "Installing Magic launcher…"
+
+  # Prefer /usr/local/bin; fall back to /opt/local/bin if needed.
   local target_dir="/usr/local/bin"
   if ! sudo install -d -m 755 "$target_dir" 2>/dev/null; then
     warn "Could not create $target_dir; falling back to /opt/local/bin."
@@ -267,13 +303,16 @@ install_magic_launcher() {
   if sudo tee "$target" >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk; do for n in sky130A sky130B; do [[ -d "$b/$n" ]]&&{ echo "$b" "$n"; return 0; }; done; done; return 1; }
+choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do for n in sky130A sky130B; do [[ -d "$b/$n" ]]&&{ echo "$b" "$n"; return 0; }; done; done; return 1; }
 read -r PDK_ROOT PDK < <(choose_pdk) || { echo "No SKY130 PDK found."; exit 1; }
 export PDK_ROOT PDK
 MAGIC_BIN="/opt/local/bin/magic"
+[[ -x "$MAGIC_BIN" ]] || MAGIC_BIN="/usr/local/bin/magic"
+[[ -x "$MAGIC_BIN" ]] || { echo "magic binary not found."; exit 1; }
 RC_WRAPPER="$HOME/.config/sky130/rc_wrapper.tcl"
 RC_PDK="$PDK_ROOT/$PDK/libs.tech/magic/${PDK}.magicrc"
 RC="$RC_PDK"; [[ -f "$RC_WRAPPER" ]] && RC="$RC_WRAPPER"
+# Ensure XQuartz is up and DISPLAY is set
 pgrep -f XQuartz >/dev/null 2>&1 || { open -a XQuartz || true; sleep 3; }
 LDISP="$(launchctl getenv DISPLAY || true)"
 if [ -z "${LDISP:-}" ]; then
@@ -282,7 +321,7 @@ if [ -z "${LDISP:-}" ]; then
   done
 fi
 export DISPLAY="${LDISP:-:0}"
-CLEAN_ENV=(/usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK")
+CLEAN_ENV=(/usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK")
 echo ">>> magic-sky130 launcher: using RC=$RC"
 if [[ "${1:-}" == "--safe" ]]; then
   exec "${CLEAN_ENV[@]}" "$MAGIC_BIN" -norcfile -dnull -noconsole -T "$PDK" -rcfile "$RC" "${@:2}"
@@ -303,37 +342,26 @@ EOF
 
 headless_check() {
   say "Running headless Magic tech check…"
-  # Find PDK
-  local PDK_BASE="" PDK_NAME=""
-  for base in "$PDK_PREFIX" "$PDK_PREFIX/share/pdk"; do
-    for name in sky130A sky130B; do
-      if [[ -f "$base/$name/libs.tech/magic/${name}.magicrc" ]]; then
-        PDK_BASE="$base"; PDK_NAME="$name"; break
-      fi
-    done
-    [[ -n "$PDK_NAME" ]] && break
-  done
-  if [[ -z "$PDK_NAME" ]]; then
-    mark_fail "Magic tech check" "Sky130 PDK not found"
-    return
+  if ! MAGIC_BIN="$(magic_path)"; then
+    mark_fail "Magic tech check" "magic binary not found"; return
   fi
-
+  if ! read -r PDK_BASE PDK_NAME < <(pdk_loc); then
+    mark_fail "Magic tech check" "Sky130 PDK not found"; return
+  fi
   ensure_dir "$DEMO_DIR"
   cat > "$DEMO_DIR/smoke.tcl" <<'EOF'
 puts ">>> smoke: tech=[tech name]"
 quit -noprompt
 EOF
-
   /usr/bin/env -i \
-    PATH="$MACPORTS_PREFIX/bin:$MACPORTS_PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    PATH="/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME" PDK_ROOT="$PDK_BASE" PDK="$PDK_NAME" \
-    /opt/local/bin/magic -norcfile -dnull -noconsole -T "$PDK_NAME" -rcfile "$RC_DIR/rc_wrapper.tcl" "$DEMO_DIR/smoke.tcl" \
-    >"$WORKDIR/magic_headless.log" 2>&1
-
-  if grep -q ">>> smoke: tech=" "$WORKDIR/magic_headless.log" 2>/dev/null; then
+    "$MAGIC_BIN" -norcfile -dnull -noconsole -T "$PDK_NAME" -rcfile "$RC_DIR/rc_wrapper.tcl" "$DEMO_DIR/smoke.tcl" \
+    >"$HEADLESS_LOG" 2>&1 || true
+  if grep -q ">>> smoke: tech=" "$HEADLESS_LOG" 2>/dev/null; then
     mark_pass "Magic headless tech load"
   else
-    mark_fail "Magic headless tech load" "See $WORKDIR/magic_headless.log"
+    mark_fail "Magic headless tech load" "See $HEADLESS_LOG"
   fi
 }
 
@@ -371,6 +399,7 @@ main() {
 
   need_xcode
   ensure_macports
+  ensure_path_now
   ensure_xquartz
   ports_install_magic
   install_pdk
