@@ -235,4 +235,140 @@ quit -noprompt
 EOF
 /usr/bin/env -i PATH="${PATH}" HOME="${HOME}" PDK_ROOT="${PBASE}" PDK="${PNAME}" \
   "${MAGIC_BIN}" -norcfile -dnull -noconsole -T "${PNAME}" "${WORKDIR}/smoke.tcl" >/dev/null 2>&1 \
-  && ok "Magic
+  && ok "Magic headless tech load OK" || warn "Magic headless tech load failed (see ${LOG})"
+
+# -------------------- Demo + RC wrapper --------------------
+next "Write demo and rc wrapper"
+RC_DIR="${HOME}/.config/sky130"
+DEMO_DIR="${HOME}/sky130-demo"
+mkdir -p "${RC_DIR}" "${DEMO_DIR}"
+
+cat > "${RC_DIR}/rc_wrapper.tcl" <<'EOF'
+if {![info exists env(PDK_ROOT)]} { set env(PDK_ROOT) "/opt/pdk" }
+if {![info exists env(PDK)]}      { set env(PDK)      "sky130A" }
+source "$env(PDK_ROOT)/$env(PDK)/libs.tech/magic/${env(PDK)}.magicrc"
+namespace eval ::sky130 { variable tries 0; variable targetGeom "1400x900+80+60" }
+proc ::sky130::apply_geometry {} {
+    variable tries; variable targetGeom
+    catch { wm attributes . -zoomed 0 }
+    catch { wm attributes . -fullscreen 0 }
+    wm geometry . $targetGeom
+    set sw [winfo screenwidth .]; set sh [winfo screenheight .]
+    catch { wm maxsize . [expr {$sw-120}] [expr {$sh-120}] }
+    if {$tries < 1} { puts ">>> rc_wrapper.tcl: geometry $targetGeom (screen=${sw}x${sh})" }
+    incr tries
+    if {$tries < 3} { after 600 ::sky130::apply_geometry }
+}
+after 120 ::sky130::apply_geometry
+bind . <Map>        { after 100 ::sky130::apply_geometry }
+bind . <Visibility> { after 150 ::sky130::apply_geometry }
+after 200 {
+  catch { wm title . "Magic ($env(PDK)) — SKY130 Classroom" }
+  catch { if {[winfo exists .console]} { wm geometry .console "+40+40" } }
+}
+EOF
+
+cat > "${DEMO_DIR}/inverter_tt.spice" <<'EOF'
+.option nomod
+.option scale=1e-6
+.lib $PDK_ROOT/${PDK}/libs.tech/ngspice/sky130.lib.spice tt
+VDD vdd 0 1.8
+VIN in  0 PULSE(0 1.8 0n 100p 100p 5n 10n)
+CL  out 0 10f
+M1 out in 0  0  sky130_fd_pr__nfet_01v8 W=1.0 L=0.15
+M2 out in vdd vdd sky130_fd_pr__pfet_01v8 W=2.0 L=0.15
+.control
+tran 0.1n 50n
+plot v(in) v(out)
+.endc
+.end
+EOF
+
+ok "Demo + rc written"
+
+# -------------------- Launchers --------------------
+next "Install launchers"
+sudo install -d -m 755 /usr/local/bin
+
+cat | sudo tee /usr/local/bin/magic-sky130 >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do
+  for n in sky130A sky130B; do [ -d "$b/$n" ] && { printf '%s %s\n' "$b" "$n"; return 0; }; done
+done; return 1; }
+# App path
+if [ -d "/Applications/Utilities/XQuartz.app" ]; then APP="/Applications/Utilities/XQuartz.app"
+elif [ -d "/Applications/XQuartz.app" ]; then APP="/Applications/XQuartz.app"
+else APP=""; fi
+# Launch XQuartz if needed
+pgrep -x XQuartz >/dev/null 2>&1 || { [ -n "$APP" ] && open -ga "$APP" || true; sleep 3; }
+# Pick DISPLAY
+LD="$(launchctl getenv DISPLAY 2>/dev/null || true)"
+if [ -z "${LD:-}" ] || [ ! -S "${LD}" ]; then
+  for d in /private/tmp/com.apple.launchd.*; do [ -S "$d/org.xquartz:0" ] && { LD="$d/org.xquartz:0"; break; }; done
+  : "${LD:=:0}"
+  export DISPLAY="$LD"; launchctl setenv DISPLAY "$LD" >/dev/null 2>&1 || true
+fi
+/opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
+MAGIC_BIN="$(command -v magic || true)"; [ -x "${MAGIC_BIN:-}" ] || { echo "magic not found"; exit 1; }
+read PDK_ROOT PDK <<<"$(choose_pdk || true)"; [ -n "${PDK_ROOT:-}" ] || { echo "No SKY130 PDK found"; exit 1; }
+RC_WRAPPER="$HOME/.config/sky130/rc_wrapper.tcl"
+RC_PDK="$PDK_ROOT/$PDK/libs.tech/magic/${PDK}.magicrc"
+RC="$RC_PDK"; [ -f "$RC_WRAPPER" ] && RC="$RC_WRAPPER"
+exec /usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK" "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
+EOF
+sudo chmod +x /usr/local/bin/magic-sky130
+
+cat | sudo tee /usr/local/bin/magic-sky130-xsafe >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do
+  for n in sky130A sky130B; do [ -d "$b/$n" ] && { printf '%s %s\n' "$b" "$n"; return 0; }; done
+done; return 1; }
+if [ -d "/Applications/Utilities/XQuartz.app" ]; then APP="/Applications/Utilities/XQuartz.app"
+elif [ -d "/Applications/XQuartz.app" ]; then APP="/Applications/XQuartz.app"
+else APP=""; fi
+defaults write org.xquartz.X11 enable_iglx -bool true >/dev/null 2>&1 || true
+pkill -x XQuartz 2>/dev/null || true
+[ -n "$APP" ] && open -ga "$APP" || true
+sleep 4
+LD="$(launchctl getenv DISPLAY 2>/dev/null || true)"
+if [ -z "${LD:-}" ] || [ ! -S "${LD}" ]; then
+  for d in /private/tmp/com.apple.launchd.*; do [ -S "$d/org.xquartz:0" ] && { LD="$d/org.xquartz:0"; break; }; done
+  : "${LD:=:0}"
+  export DISPLAY="$LD"; launchctl setenv DISPLAY "$LD" >/dev/null 2>&1 || true
+fi
+/opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
+MAGIC_BIN="$(command -v magic || true)"; [ -x "${MAGIC_BIN:-}" ] || { echo "magic not found"; exit 1; }
+read PDK_ROOT PDK <<<"$(choose_pdk || true)"; [ -n "${PDK_ROOT:-}" ] || { echo "No SKY130 PDK found"; exit 1; }
+RC_WRAPPER="$HOME/.config/sky130/rc_wrapper.tcl"
+RC_PDK="$PDK_ROOT/$PDK/libs.tech/magic/${PDK}.magicrc"
+RC="$RC_PDK"; [ -f "$RC_WRAPPER" ] && RC="$RC_WRAPPER"
+export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+exec /usr/bin/env -i PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" SHELL=/bin/zsh TERM=xterm-256color LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$DISPLAY" PDK_ROOT="$PDK_ROOT" PDK="$PDK" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$MAGIC_BIN" -norcfile -d X11 -T "$PDK" -rcfile "$RC" "$@"
+EOF
+sudo chmod +x /usr/local/bin/magic-sky130-xsafe
+ok "Launchers installed"
+
+# -------------------- Final GUI probe --------------------
+next "Quick GUI probe"
+APP="$(_xq_app || true)"
+[ -n "${APP}" ] && open -ga "${APP}" || true
+sleep 2
+/opt/X11/bin/xset -q >/dev/null 2>&1 || warn "X server didn't answer to xset (GUI may still come up)"
+if command -v magic-sky130 >/dev/null 2>&1; then
+  ok "Try:  magic-sky130    (or: magic-sky130-xsafe)"
+fi
+
+# -------------------- Summary --------------------
+next "Done"
+echo
+say "Install complete"
+echo "Log: ${LOG}"
+echo "Launch:"
+echo "  • magic-sky130           (GUI via X11)"
+echo "  • magic-sky130-xsafe     (GUI with software OpenGL)"
+echo
+echo "SPICE demo:"
+echo "  cd \"${HOME}/sky130-demo\" && ngspice inverter_tt.spice"
+echo
