@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sky130-mac.sh — macOS bootstrap for Magic + SKY130 PDK
-# macOS 12–15 (Monterey→Sequoia), Intel+Apple Silicon
+# Supports macOS 12–15 (Monterey→Sequoia), Intel & Apple Silicon
 
 set -Eeuo pipefail
 
@@ -202,11 +202,9 @@ ensure_xquartz() {
 ensure_port() {
   # ensure_port <portname> [variants...]
   local name="$1"; shift || true
-  if port installed "${name}" >/dev/null 2>&1; then
-    run "port upgrade --enforce-variants ${name} $*" sudo port -N upgrade --enforce-variants "${name}" "$@"
-  else
-    run "port install ${name} $*" sudo port -N install "${name}" "$@"
-  fi
+  # Always install first (idempotent), then enforce variants.
+  run "port install ${name} $*"        sudo port -N install "${name}" "$@" || true
+  run "port upgrade --enforce-variants ${name} $*" sudo port -N upgrade --enforce-variants "${name}" "$@" || true
 }
 
 install_magic_ports() {
