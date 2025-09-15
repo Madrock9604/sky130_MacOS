@@ -120,6 +120,19 @@ xquartz_sanity() {
   /opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
   /opt/X11/bin/xset -q >/dev/null 2>&1
 }
+install_x11_libs() {
+  pkgs="xorgproto libXau libXdmcp libxcb libX11 libXext libXrender libXft libXpm zlib cairo"
+  for p in $pkgs; do
+    echo ">> installing $p"
+    sudo port -N -f clean --all "$p" >>"$LOG" 2>&1 || true
+    sudo port -N install "$p" >>"$LOG" 2>&1 || sudo port -d install "$p" >>"$LOG" 2>&1 || {
+      echo "!! $p failed, showing last 60 log lines:" >>"$LOG"
+      tail -n 60 "/opt/local/var/macports/logs"/*/"$p"/*.log >>"$LOG" 2>&1 || true
+      return 1
+    }
+  done
+  sudo port -N rev-upgrade >>"$LOG" 2>&1 || true
+}
 
 ### --------- Steps ---------
 say "Log: $LOG"
@@ -183,7 +196,7 @@ ok "XQuartz running (DISPLAY=$(xquartz_display))"
 bar "Install Tcl/Tk +X11 and tools"
 run "Install Tk +x11" sudo port -N upgrade --enforce-variants tk +x11 || sudo port -N install tk +x11
 run "Install toolchain" sudo port -N install git autoconf automake libtool pkgconfig
-run "Install X11 libs" sudo port -N install libX11 libXext libXrender libXft libXpm xorgproto cairo zlib
+run "Install X11 libs (robust)" install_x11_libs
 
 bar "Install Magic (+x11) & EDA tools"
 run "Install Magic +x11" sudo port -N upgrade --enforce-variants magic +x11 -quartz || sudo port -N install magic +x11
