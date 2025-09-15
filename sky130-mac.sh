@@ -208,11 +208,11 @@ ensure_port() {
 }
 
 install_magic_ports() {
-  step "Install Magic (+x11) and tools via MacPorts"
+  step "Install Magic (+x11, no OpenGL) and tools via MacPorts"
   ensure_path
   run "Update ports tree" sudo port -N -v sync || true
   ensure_port tk +x11
-  ensure_port magic +x11
+  ensure_port magic +x11 -opengl
   run "Install common EDA tools" sudo port -N install ngspice netgen gawk wget tcl tk git || true
   command -v magic >/dev/null 2>&1 || die "Magic is not available on PATH after install."
   ok "Magic installed: $(magic -version 2>/dev/null | head -n1 || echo from MacPorts)"
@@ -368,7 +368,7 @@ if [ -z "${LDISP:-}" ]; then
 fi
 export DISPLAY="${LDISP:-:0}"
 /opt/X11/bin/xhost +SI:localuser:"$USER" >/dev/null 2>&1 || true
-export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe LIBGL_DRI3_DISABLE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
 choose_pdk(){ for b in /opt/pdk /opt/pdk/share/pdk /usr/local/share/pdk; do
   for n in sky130A sky130B; do [ -d "$b/$n" ] && { printf '%s %s\n' "$b" "$n"; return 0; }; done
 done; return 1; }
