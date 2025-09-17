@@ -105,10 +105,15 @@ ensure_xcode() {
 
 # ----- 1) Homebrew (for deps) -----
 ensure_homebrew() {
-  # If brew already exists, just wire it up and return
+  # Hard stop if running as root (Homebrew won't allow it)
+  if [ "$(id -u)" -eq 0 ]; then
+    fail "Homebrew cannot be installed as root. Re-run this installer as a normal user (no sudo)."
+  fi
+
+  # Already installed?
   if command -v brew >/dev/null 2>&1; then
     BREW_BIN="$(command -v brew)"
-    # Make sure shellenv is active in this session
+    # Wire shellenv for this session
     if [ -x /opt/homebrew/bin/brew ]; then
       eval "$(/opt/homebrew/bin/brew shellenv)"
     elif [ -x /usr/local/bin/brew ]; then
@@ -120,32 +125,27 @@ ensure_homebrew() {
 
   info "Installing Homebrew…"
 
-  # Use NONINTERACTIVE if installer was called with -y
+  # Run the official installer; attach stdin to the real terminal (/dev/tty)
   if [ "${YES:-false}" = true ]; then
-    # Non-interactive, but still attach to /dev/tty so password/CLT prompts work if needed
     run 'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty'
   else
-    # Interactive path (attach stdin to the real terminal, not the pipeline)
     run '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty'
   fi
 
-  # Detect brew location (Apple Silicon vs Intel) and export for this session
+  # Make brew available immediately in this shell
   if [ -x /opt/homebrew/bin/brew ]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
   elif [ -x /usr/local/bin/brew ]; then
     eval "$(/usr/local/bin/brew shellenv)"
   else
-    # Fallback: search common roots in case the installer finished but PATH isn't set yet
     BREW_BIN="$(/usr/bin/find /opt /usr/local "$HOME" -type f -name brew -maxdepth 4 2>/dev/null | /usr/bin/head -n1 || true)"
-    if [ -n "$BREW_BIN" ]; then
-      eval "$("$BREW_BIN" shellenv)"
-    fi
+    [ -n "$BREW_BIN" ] && eval "$("$BREW_BIN" shellenv)"
   fi
 
   BREW_BIN="$(command -v brew 2>/dev/null || true)"
   [ -n "$BREW_BIN" ] || fail "Homebrew installation appears to have failed."
 
-  # Persist Homebrew shellenv to ~/.zprofile so new terminals have brew on PATH
+  # Persist shellenv for future terminals
   ZFILE="$HOME/.zprofile"
   if ! grep -q 'Homebrew (added by sky130 installer)' "$ZFILE" 2>/dev/null; then
     {
@@ -161,6 +161,7 @@ ensure_homebrew() {
 
   ok "Homebrew installed at $(brew --prefix)"
 }
+
 
 
 # ----- 2) Homebrew dependencies -----
