@@ -197,24 +197,52 @@ build_open_pdks() {
   info "Building and installing open_pdks (sky130A)…"
   mkdir -p "$SRC_ROOT" "$PDK_PREFIX"
   cd "$SRC_ROOT"
+
   if [ ! -d open_pdks ]; then
     run "git clone https://github.com/RTimothyEdwards/open_pdks.git"
   fi
   cd open_pdks
-  run "git fetch --all -q && git pull -q"
-  run "make clean || git clean -xfd || true"
+
+  # HARD CLEAN to avoid stale gf180-only Makefiles
+  run "git fetch -q --all"
+  run "git reset -q --hard"
+  run "git clean -xfd -q"
+  run "make distclean || true"
+  run "make veryclean || true"
+
+  # Help builds find Homebrew Tcl/Tk
   TCLTK_PREFIX="$(brew --prefix tcl-tk 2>/dev/null || true)"
   if [ -n "$TCLTK_PREFIX" ]; then
     export LDFLAGS="-L$TCLTK_PREFIX/lib ${LDFLAGS-}"
     export CPPFLAGS="-I$TCLTK_PREFIX/include ${CPPFLAGS-}"
     export PKG_CONFIG_PATH="$TCLTK_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   fi
+
+  # Ensure magic is on PATH (needed to generate tech files)
   PATH="$MAGIC_PREFIX/bin:$PATH"; export PATH
-  run "./configure --prefix='$PDK_PREFIX' --enable-sky130-pdk --with-sky130-variants=A"
+
+  # Configure SKY130 ONLY to avoid accidental gf180-only builds
+  run "./configure --prefix='$PDK_PREFIX' \
+       --enable-sky130-pdk --with-sky130-variants=A \
+       --disable-gf180mcu-pdk"
+
+  # Build + install
   run "make -j$CORES"
   run "make -j$CORES install"
+
+  # Sanity: confirm the rc (and try once more if .tech wasn’t emitted yet)
+  PDK_ROOT_CAND="$PDK_PREFIX/share/pdk"
+  if [ ! -f "$PDK_ROOT_CAND/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
+    fail "sky130A.magicrc not found under $PDK_ROOT_CAND — build failed?"
+  fi
+  if [ ! -f "$PDK_ROOT_CAND/sky130A/libs.tech/magic/sky130A.tech" ]; then
+    warn "sky130A.tech missing; retrying 'make install' once…"
+    run "make -j$CORES install || true"
+  fi
+
   ok "open_pdks installed under $PDK_PREFIX"
 }
+
 
 # ---- 5) Locate PDK_ROOT (must be the parent that CONTAINS sky130A/) ----
 find_pdk_root() {
