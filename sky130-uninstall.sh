@@ -135,7 +135,7 @@ fi
 case "$PDK_ROOT" in
   */share/pdk) PDK_PREFIX=$(dirname "$PDK_ROOT") ;;
   *) PDK_PREFIX="${PDK_PREFIX_ENV:-$DEFAULT_PDK_PREFIX}" ;;
-sc esac
+esac
 
 printf '%s
 ' "[i] Using PDK_ROOT=$PDK_ROOT"
