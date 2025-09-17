@@ -1,7 +1,14 @@
 #!/bin/sh
 # SKY130 macOS — Aggressive Uninstaller (POSIX sh)
-# Removes SKY130A PDK + Magic (brew/ports/user-built) and configs/launchers so
-# Magic no longer auto-loads sky130A. Scans system paths like /opt/pdk.
+# ------------------------------------------------
+# Removes SKY130A PDK + Magic (Homebrew/MacPorts/user-built) and configs/launchers
+# so Magic no longer auto-loads sky130A. Also deletes any "magic-sky130" helper.
+#
+# Usage:
+#   sh sky130-uninstall.sh               # interactive
+#   sh sky130-uninstall.sh -y            # auto-yes (no prompts)
+#   sh sky130-uninstall.sh --dry-run     # preview actions
+#   sh sky130-uninstall.sh --scan /extra/path --scan /another/path
 
 set -eu
 
@@ -27,24 +34,63 @@ ok(){   printf '\033[1;32m[✓]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 fail(){ printf '\033[1;31m[x]\033[0m %s\n' "$*"; exit 1; }
 
-confirm(){ prompt="$1"; if [ "$YES" = true ]; then return 0; fi; printf '%s [y/N]: ' "$prompt"; read ans || ans=""; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
+confirm(){
+  prompt="$1"
+  if [ "$YES" = true ]; then return 0; fi
+  if [ -t 0 ]; then
+    printf '%s [y/N]: ' "$prompt"
+    read ans || ans=""
+  else
+    printf '%s [y/N]: ' "$prompt" > /dev/tty
+    read ans < /dev/tty || ans=""
+  fi
+  [ "$ans" = "y" ] || [ "$ans" = "Y" ]
+}
 
-run(){ if [ "$DRY" = true ]; then printf 'DRY-RUN: %s\n' "$*"; else sh -c "$*"; fi; }
+run(){
+  if [ "$DRY" = true ]; then
+    printf 'DRY-RUN: %s\n' "$*"
+  else
+    sh -c "$*"
+  fi
+}
 
-# remove with sudo fallback if needed
+# remove with sudo/GUI fallback if needed
 HAS_TTY=0; [ -t 1 ] && HAS_TTY=1
-run_admin(){ _cmd="$1"; if [ "$DRY" = true ]; then [ "$HAS_TTY" -eq 1 ] && printf 'DRY-RUN sudo %s\n' "$_cmd" || printf 'DRY-RUN (GUI sudo) %s\n' "$_cmd"; return 0; fi; if [ "$HAS_TTY" -eq 1 ]; then sudo -n true 2>/dev/null || sudo -v || fail "Admin privileges required"; sh -c "sudo $_cmd"; else _esc=`printf %s "$_cmd" | sed 's/\\/\\\\/g; s/"/\\"/g'`; /usr/bin/osascript -e "do shell script \"$_esc\" with administrator privileges"; fi; }
+run_admin(){
+  _cmd="$1"
+  if [ "$DRY" = true ]; then
+    [ "$HAS_TTY" -eq 1 ] && printf 'DRY-RUN sudo %s\n' "$_cmd" || printf 'DRY-RUN (GUI sudo) %s\n' "$_cmd"
+    return 0
+  fi
+  if [ "$HAS_TTY" -eq 1 ]; then
+    sudo -n true 2>/dev/null || sudo -v || fail "Admin privileges required"
+    sh -c "sudo $_cmd"
+  else
+    _esc=`printf %s "$_cmd" | sed 's/\\/\\\\/g; s/"/\\"/g'`
+    /usr/bin/osascript -e "do shell script \"$_esc\" with administrator privileges"
+  fi
+}
 
 rmrf_any(){
   tgt="$1"
   if [ ! -e "$tgt" ]; then info "Not found: $tgt"; return 0; fi
-  if [ "$DRY" = true ]; then printf 'DRY-RUN rm -rf %s\n' "$tgt"; return 0; fi
+  if [ "$DRY" = true ]; then
+    printf 'DRY-RUN rm -rf %s\n' "$tgt"
+    return 0
+  fi
   rm -rf -- "$tgt" 2>/dev/null || run_admin "rm -rf -- '$tgt'"
   ok "Removed: $tgt"
 }
 
 # delete BEGIN..END block safely (no sed -i dependency)
-delete_block_in_file(){ start="$1"; end="$2"; f="$3"; [ -f "$f" ] || return 0; tmp="$f.tmp.$(date +%s)"; awk 'BEGIN{del=0}{if($0~start){del=1} if(!del)print; if($0~end&&del==1){del=0}}' start="$start" end="$end" "$f" > "$tmp" && mv "$tmp" "$f"; }
+delete_block_in_file(){
+  start="$1"; end="$2"; f="$3"
+  [ -f "$f" ] || return 0
+  tmp="$f.tmp.$(date +%s)"
+  awk 'BEGIN{del=0}{if($0~start){del=1} if(!del)print; if($0~end && del==1){del=0}}' \
+      start="$start" end="$end" "$f" > "$tmp" && mv "$tmp" "$f"
+}
 
 # ---------- detect package managers ----------
 BREW_BIN=`command -v brew 2>/dev/null || echo ''`
@@ -58,7 +104,7 @@ add_unique(){ item="$1"; list="$2"; echo "$list" | awk -v i="$item" 'BEGIN{f=0}$
 SCAN_BASES=""
 append_base(){ d="$1"; [ -n "$d" ] && [ -d "$d" ] && SCAN_BASES=`add_unique "$d" "$SCAN_BASES"` || true; }
 
-# defaults + system paths + where you are + git root + extras
+# defaults + common system prefixes + where you are + git root + extras
 append_base "$HOME"
 append_base "$HOME/eda"
 append_base "$HOME/eda/pdks"
@@ -66,8 +112,8 @@ append_base "$HOME/.eda-bootstrap"
 append_base "/opt"
 append_base "/opt/pdk"
 append_base "/opt/pdk/share/pdk"
-append_base "/opt/homebrew"
 append_base "/usr/local"
+append_base "/opt/homebrew"
 append_base "/opt/local"
 append_base "/Applications"
 append_base "$PWD"
@@ -80,25 +126,26 @@ CAND_PDK_DIRS=""
 CAND_MAGICRCS=""
 CAND_MAGIC_BINS=""
 CAND_WRAPPERS=""
+CAND_HELPERS=""
 
 collect(){
   info "Scanning for SKY130A PDK, Magic, and rc/wrappers…"
   for b in $SCAN_BASES; do
     [ -d "$b" ] || continue
-    # sky130A by signature file
+    # PDK by signature file
     for f in `find "$b" -type f -name sky130A.magicrc -path '*/sky130A/libs.tech/magic/*' 2>/dev/null`; do
       d1=`dirname "$f"`; d2=`dirname "$d1"`; d3=`dirname "$d2"`; sky=`dirname "$d3"`
       CAND_PDK_DIRS=`add_unique "$sky" "$CAND_PDK_DIRS"`
     done
-    # sky130A fallback tree pattern
+    # fallback tree pattern
     for d in `find "$b" -type d -name sky130A -path '*/pdk/sky130A' 2>/dev/null`; do
       CAND_PDK_DIRS=`add_unique "$d" "$CAND_PDK_DIRS"`
     done
-    # .magicrc / magicrc that reference sky130A
+    # rc files that reference sky130A
     for f in `find "$b" -type f \( -name .magicrc -o -name magicrc \) 2>/dev/null`; do
       grep 'sky130A' "$f" >/dev/null 2>&1 && CAND_MAGICRCS=`add_unique "$f" "$CAND_MAGICRCS"`
     done
-    # magic binaries (including app bundles)
+    # magic binaries (and potential wrappers)
     for m in `find "$b" -type f -perm -111 \( -name magic -o -name Magic -o -name magic\* \) 2>/dev/null`; do
       CAND_MAGIC_BINS=`add_unique "$m" "$CAND_MAGIC_BINS"`
       # wrapper scripts that hardcode sky130A rc
@@ -106,9 +153,14 @@ collect(){
         grep -q 'sky130A\.magicrc' "$m" 2>/dev/null && CAND_WRAPPERS=`add_unique "$m" "$CAND_WRAPPERS"`
       fi
     done
+    # helper named exactly "magic-sky130"
+    for h in `find "$b" -type f -name magic-sky130 -perm -111 2>/dev/null`; do
+      CAND_HELPERS=`add_unique "$h" "$CAND_HELPERS"`
+    done
   done
   # PATH too
   if command -v magic >/dev/null 2>&1; then CAND_MAGIC_BINS=`add_unique "$(command -v magic)" "$CAND_MAGIC_BINS"`; fi
+  if command -v magic-sky130 >/dev/null 2>&1; then CAND_HELPERS=`add_unique "$(command -v magic-sky130)" "$CAND_HELPERS"`; fi
 }
 
 # ---------- remove PDK trees ----------
@@ -122,10 +174,11 @@ remove_pdks(){
 
 # ---------- uninstall Magic + tools ----------
 remove_magic(){
+  # Homebrew
   if [ -n "$BREW_BIN" ]; then
     info "Checking Homebrew packages…"
     if brew_has magic || brew_has magic-netgen; then confirm "Uninstall Magic (Homebrew)?" && run "brew uninstall --ignore-dependencies magic magic-netgen || true"; fi
-    if brew_has netgen && confirm "Uninstall Netgen (Homebrew)?" ; then run "brew uninstall --ignore-dependencies netgen || true"; fi
+    if brew_has netgen && confirm "Uninstall Netgen (Homebrew)?"; then run "brew uninstall --ignore-dependencies netgen || true"; fi
     if brew_has xschem && confirm "Uninstall Xschem (Homebrew)?"; then run "brew uninstall --ignore-dependencies xschem || true"; fi
     if brew_has ngspice && confirm "Uninstall ngspice (Homebrew)?"; then run "brew uninstall --ignore-dependencies ngspice || true"; fi
     if brew_has klayout || brew_has_cask klayout; then
@@ -134,6 +187,7 @@ remove_magic(){
     if brew_has_cask xquartz && confirm "Uninstall XQuartz (Homebrew)?"; then run "brew uninstall --cask xquartz || true"; fi
   else warn "Homebrew not detected; skipping brew removals."; fi
 
+  # MacPorts
   if [ -n "$PORT_BIN" ]; then
     info "Checking MacPorts ports…"
     for p in magic netgen xschem ngspice klayout open_pdks openpdks open_pdks-sky130; do
@@ -148,27 +202,40 @@ remove_magic(){
   done
 }
 
-# ---------- remove wrappers that force sky130A rc ----------
-remove_wrappers(){
-  [ -z "$CAND_WRAPPERS" ] && return 0
-  info "Wrappers that hardcode sky130A rc:"; echo "$CAND_WRAPPERS" | sed 's/^/  - /'
-  if confirm "Backup and remove ALL listed wrappers?"; then
-    for w in $CAND_WRAPPERS; do ts=`date +%Y%m%d%H%M%S`; run "cp '$w' '$w.bak.$ts'"; rmrf_any "$w"; done
+# ---------- remove wrappers + helpers ----------
+remove_wrappers_and_helpers(){
+  if [ -n "$CAND_WRAPPERS" ]; then
+    info "Wrappers that hardcode sky130A rc:"; echo "$CAND_WRAPPERS" | sed 's/^/  - /'
+    if confirm "Backup and remove ALL listed wrappers?"; then
+      for w in $CAND_WRAPPERS; do ts=`date +%Y%m%d%H%M%S`; run "cp '$w' '$w.bak.$ts'"; rmrf_any "$w"; done
+    fi
+  fi
+  if [ -n "$CAND_HELPERS" ]; then
+    info "magic-sky130 helpers found:"; echo "$CAND_HELPERS" | sed 's/^/  - /'
+    if confirm "Remove ALL magic-sky130 helpers?"; then
+      for h in $CAND_HELPERS; do rmrf_any "$h"; done
+    fi
   fi
 }
 
 # ---------- clean configs ----------
 clean_configs(){
   rmrf_any "$HOME/.config/sky130/rc_wrapper.tcl"
+
+  # ~/.magicrc referencing sky130A
   if [ -f "$HOME/.magicrc" ] && grep 'sky130A' "$HOME/.magicrc" >/dev/null 2>&1; then
     ts=`date +%Y%m%d%H%M%S`; confirm "~/.magicrc references sky130A. Backup and remove it?" && { run "cp '$HOME/.magicrc' '$HOME/.magicrc.bak.$ts'"; rmrf_any "$HOME/.magicrc"; }
   fi
+
+  # project rc files
   if [ -n "$CAND_MAGICRCS" ]; then
     info "rc files referencing sky130A:"; echo "$CAND_MAGICRCS" | sed 's/^/  - /'
     if confirm "Backup and remove ALL above rc files?"; then
       for f in $CAND_MAGICRCS; do ts=`date +%Y%m%d%H%M%S`; run "cp '$f' '$f.bak.$ts'"; rmrf_any "$f"; done
     fi
   fi
+
+  # strip env from shell files
   for z in "$HOME/.zprofile" "$HOME/.zshrc"; do
     [ -f "$z" ] || continue
     ts=`date +%Y%m%d%H%M%S`; run "cp '$z' '$z.bak.$ts'"
@@ -190,17 +257,19 @@ clean_configs(){
 # ---------- post check ----------
 post_check(){
   info "Post-uninstall check"
+  if command -v magic-sky130 >/dev/null 2>&1; then warn "magic-sky130 still in PATH at: $(command -v magic-sky130)"; fi
   if command -v magic >/dev/null 2>&1; then
     echo "Magic still present at: $(command -v magic)"
-    echo "Open Magic and run ':tech' — it should NOT say 'sky130A'."
+    echo "If you want to remove it too, re-run and confirm package removal."
   else ok "No 'magic' in PATH."; fi
+  echo "Open a new terminal (or run: exec \$SHELL -l) to refresh environment."
 }
 
 # ---------- main ----------
 collect
 remove_pdks
 remove_magic
-remove_wrappers
+remove_wrappers_and_helpers
 clean_configs
 post_check
-ok "Uninstall complete. Open a new terminal for a clean environment."
+ok "Uninstall complete."
