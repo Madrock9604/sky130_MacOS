@@ -1,18 +1,37 @@
 #!/bin/sh
 # SKY130 macOS — Aggressive Uninstaller (POSIX sh)
-# Finds and removes SKY130A PDK + Magic (brew/ports/user-built) and configs so
-# Magic no longer auto-loads sky130A.
+# ------------------------------------------------
+# Finds and removes SKY130A PDK + Magic (Homebrew/MacPorts/user-built) and
+# cleans configs/env so Magic no longer auto-loads sky130A — **including
+# project folders you specify or where you run this from**.
+#
+# Usage:
+#   sh sky130-uninstall.sh                 # interactive
+#   sh sky130-uninstall.sh -y              # remove everything without prompts
+#   sh sky130-uninstall.sh --dry-run       # preview
+#   sh sky130-uninstall.sh --scan /path/to/projects --scan /another/path
+#   EXTRA_SCAN_DIRS="/class/projects:/mnt/shared" sh sky130-uninstall.sh
+#
+# Notes:
+# - By default we scan: $HOME, $HOME/eda, $HOME/eda/pdks, $HOME/.eda-bootstrap,
+#   /opt/homebrew, /usr/local, /opt/local, **$PWD**, and **git repo root** (if any).
+# - We only delete .magicrc/magicrc files that reference sky130A, and we back them up first.
 
 set -eu
 
 YES=false
 DRY=false
+EXTRA_DIRS=""
 
 # ---------- args ----------
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -y|--yes) YES=true ;;
     --dry-run) DRY=true ;;
+    --scan)
+      shift || true
+      [ -n "${1-}" ] || { printf '[x] --scan requires a path\n' >&2; exit 1; }
+      EXTRA_DIRS="${EXTRA_DIRS}\n$1" ;;
     -h|--help) sed -n '1,200p' "$0"; exit 0 ;;
     *) printf '[!] Unknown arg: %s\n' "$1" ;;
   esac
@@ -49,7 +68,7 @@ rmrf() {
   ok "Removed: $tgt"
 }
 
-# tty/GUI-aware elevation (for MacPorts)
+# tty/GUI-aware privilege elevation (for MacPorts)
 HAS_TTY=0; [ -t 1 ] && HAS_TTY=1
 run_admin() {
   _cmd="$1"
@@ -66,7 +85,7 @@ run_admin() {
   fi
 }
 
-# delete lines between markers (inclusive) without relying on sed -i variants
+# delete lines between markers (inclusive) without sed -i variants
 delete_block_in_file() {
   start="$1"; end="$2"; f="$3"
   [ -f "$f" ] || return 0
@@ -111,10 +130,40 @@ add_line_unique() {
   ' | sed '/^$/d'
 }
 
+append_base() {
+  dir="$1"
+  [ -n "$dir" ] || return 0
+  [ -d "$dir" ] || return 0
+  SCAN_BASES=`add_line_unique "$dir" "${SCAN_BASES-}"`
+}
+
+# Build scan bases: defaults + PWD + git root + EXTRA + env
+SCAN_BASES=""
+append_base "$HOME"
+append_base "$HOME/eda"
+append_base "$HOME/eda/pdks"
+append_base "$HOME/.eda-bootstrap"
+append_base "/opt/homebrew"
+append_base "/usr/local"
+append_base "/opt/local"
+append_base "$PWD"
+# git repo root (if any)
+GITROOT=`command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel 2>/dev/null || echo ''`
+append_base "$GITROOT"
+# EXTRA from args
+if [ -n "$EXTRA_DIRS" ]; then
+  for x in $EXTRA_DIRS; do append_base "$x"; done
+fi
+# EXTRA from env (colon-separated)
+if [ -n "${EXTRA_SCAN_DIRS-}" ]; then
+  IFS_SAVE=$IFS; IFS=":"
+  for x in $EXTRA_SCAN_DIRS; do IFS="$IFS_SAVE"; append_base "$x"; IFS=":"; done
+  IFS="$IFS_SAVE"
+fi
+
 collect_candidates() {
   info "Scanning for SKY130A and Magic…"
-  bases="$HOME $HOME/eda $HOME/eda/pdks $HOME/.eda-bootstrap /opt/homebrew /usr/local /opt/local"
-  for b in $bases; do
+  for b in $SCAN_BASES; do
     [ -d "$b" ] || continue
     # find SKY130A by file signature
     for f in `find "$b" -type f -name sky130A.magicrc -path '*/sky130A/libs.tech/magic/*' 2>/dev/null`; do
@@ -125,18 +174,16 @@ collect_candidates() {
     for d in `find "$b" -type d -name sky130A -path '*/pdk/sky130A' 2>/dev/null`; do
       CAND_PDK_DIRS=`add_line_unique "$d" "$CAND_PDK_DIRS"`
     done
-    # .magicrc files referencing sky130A (only under $HOME tree for safety)
-    case "$b" in "$HOME"|"$HOME/eda") 
-      for f in `find "$b" -type f -name .magicrc 2>/dev/null`; do
-        grep 'sky130A' "$f" >/dev/null 2>&1 && CAND_MAGICRCS=`add_line_unique "$f" "$CAND_MAGICRCS"`
-      done
-    ;; esac
+    # .magicrc / magicrc files that reference sky130A
+    for f in `find "$b" -type f \( -name .magicrc -o -name magicrc \) 2>/dev/null`; do
+      grep 'sky130A' "$f" >/dev/null 2>&1 && CAND_MAGICRCS=`add_line_unique "$f" "$CAND_MAGICRCS"`
+    done
     # magic binaries (executable)
     for m in `find "$b" -type f -name magic -perm -111 2>/dev/null`; do
       CAND_MAGIC_BINS=`add_line_unique "$m" "$CAND_MAGIC_BINS"`
     done
   done
-  # also current PATH
+  # also PATH
   if command -v magic >/dev/null 2>&1; then
     mpath=`command -v magic`
     CAND_MAGIC_BINS=`add_line_unique "$mpath" "$CAND_MAGIC_BINS"`
@@ -225,7 +272,7 @@ clean_configs() {
   # remove wrapper that caused issues historically
   rmrf "$HOME/.config/sky130/rc_wrapper.tcl"
 
-  # our ~/.magicrc or any .magicrc that references sky130A (under $HOME)
+  # ~/.magicrc or project magicrc files that reference sky130A
   if [ -f "$HOME/.magicrc" ]; then
     if grep 'sky130A' "$HOME/.magicrc" >/dev/null 2>&1; then
       ts=`date +%Y%m%d%H%M%S`
@@ -236,9 +283,9 @@ clean_configs() {
     fi
   fi
   if [ -n "$CAND_MAGICRCS" ]; then
-    info "Other .magicrc files referencing sky130A:"
+    info "Project rc files referencing sky130A:"
     echo "$CAND_MAGICRCS" | sed 's/^/  - /'
-    if confirm "Backup and remove ALL above .magicrc files?"; then
+    if confirm "Backup and remove ALL above rc files?"; then
       for f in $CAND_MAGICRCS; do
         ts=`date +%Y%m%d%H%M%S`
         run "cp '$f' '$f.bak.$ts'"
@@ -272,7 +319,7 @@ post_check() {
   info "Post-uninstall check"
   if command -v magic >/dev/null 2>&1; then
     printf '%s\n' "Magic still present at: $(command -v magic)"
-    printf '%s\n' "Open Magic and run ':tech' — it should NOT say 'sky130A'."
+    printf '%s\n' "Open Magic in a project folder and run ':tech' — it should NOT say 'sky130A'."
   else
     ok "No 'magic' in PATH."
   fi
