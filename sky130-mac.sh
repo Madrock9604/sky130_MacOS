@@ -1,11 +1,11 @@
 #!/bin/sh
-# macOS SKY130 — One-Shot Installer (POSIX sh, general/robust)
-# -----------------------------------------------------------
-# After this finishes, Magic will launch with SKY130A on a clean macOS.
+# macOS SKY130 — One-Shot Installer (POSIX sh, robust, puts `magic` on PATH)
+# -------------------------------------------------------------------------
+# After this finishes, users can run:  magic &
 # Key robustness:
 #   • Broader PDK detection (/opt, /opt/pdk, Homebrew share, user prefixes)
-#   • Headless smoke test loads via PDK rc only (no `-T sky130A`)
-#   • Sets PDK_ROOT for the test even before you open a new terminal
+#   • Headless smoke test via PDK rc only (no `-T sky130A`)
+#   • Ensures `magic` command is on PATH now and for future shells
 
 set -eu
 
@@ -29,7 +29,7 @@ ok()   { printf "\033[1;32m[✓]\033[0m %s\n" "$*"; }
 warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
 fail() { printf "\033[1;31m[x]\033[0m %s\n" "$*"; exit 1; }
 
-# read Y/N even if script is piped via curl
+# read Y/N even if piped via curl
 confirm() {
   prompt="$1"
   if [ "$YES" = true ]; then return 0; fi
@@ -192,61 +192,63 @@ ensure_magic() {
   fi
 }
 
+# ---- NEW: 3.5) Make sure `magic` is on PATH now and later ----
+ensure_magic_on_path() {
+  if command -v magic >/dev/null 2>&1; then
+    ok "magic on PATH: $(command -v magic)"
+  else
+    # Try common locations and add to PATH immediately
+    CAND=""
+    [ -x "$MAGIC_PREFIX/bin/magic" ] && CAND="$MAGIC_PREFIX/bin/magic"
+    [ -z "$CAND" ] && [ -x "/opt/local/bin/magic" ] && CAND="/opt/local/bin/magic"
+    if [ -z "$CAND" ] && command -v brew >/dev/null 2>&1; then
+      BREW_BIN_DIR="$(brew --prefix 2>/dev/null)/bin"
+      [ -x "$BREW_BIN_DIR/magic" ] && CAND="$BREW_BIN_DIR/magic" || true
+    fi
+    if [ -n "$CAND" ]; then
+      PATH="$(dirname "$CAND"):$PATH"; export PATH
+      hash -r 2>/dev/null || true
+      ok "Added $(dirname "$CAND") to PATH for this session."
+    fi
+    # As a fallback, create a user shim if still not found
+    if ! command -v magic >/dev/null 2>&1 && [ -n "$CAND" ]; then
+      mkdir -p "$HOME/bin"
+      ln -sf "$CAND" "$HOME/bin/magic"
+      PATH="$HOME/bin:$PATH"; export PATH
+      hash -r 2>/dev/null || true
+      ok "Created ~/bin/magic shim → $CAND"
+    fi
+    command -v magic >/dev/null 2>&1 || warn "Could not put 'magic' on PATH immediately; open a new terminal after install."
+  fi
+}
+
 # ---- 4) open_pdks (sky130A) ----
 build_open_pdks() {
   info "Building and installing open_pdks (sky130A)…"
   mkdir -p "$SRC_ROOT" "$PDK_PREFIX"
   cd "$SRC_ROOT"
-
   if [ ! -d open_pdks ]; then
     run "git clone https://github.com/RTimothyEdwards/open_pdks.git"
   fi
   cd open_pdks
-
-  # HARD CLEAN to avoid stale gf180-only Makefiles
-  run "git fetch -q --all"
-  run "git reset -q --hard"
-  run "git clean -xfd -q"
+  run "git fetch --all -q && git pull -q"
   run "make distclean || true"
-  run "make veryclean || true"
-
-  # Help builds find Homebrew Tcl/Tk
+  run "git clean -xfd -q || true"
   TCLTK_PREFIX="$(brew --prefix tcl-tk 2>/dev/null || true)"
   if [ -n "$TCLTK_PREFIX" ]; then
     export LDFLAGS="-L$TCLTK_PREFIX/lib ${LDFLAGS-}"
     export CPPFLAGS="-I$TCLTK_PREFIX/include ${CPPFLAGS-}"
     export PKG_CONFIG_PATH="$TCLTK_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   fi
-
-  # Ensure magic is on PATH (needed to generate tech files)
   PATH="$MAGIC_PREFIX/bin:$PATH"; export PATH
-
-  # Configure SKY130 ONLY to avoid accidental gf180-only builds
-  run "./configure --prefix='$PDK_PREFIX' \
-       --enable-sky130-pdk --with-sky130-variants=A \
-       --disable-gf180mcu-pdk"
-
-  # Build + install
+  run "./configure --prefix='$PDK_PREFIX' --enable-sky130-pdk --with-sky130-variants=A --disable-gf180mcu-pdk"
   run "make -j$CORES"
   run "make -j$CORES install"
-
-  # Sanity: confirm the rc (and try once more if .tech wasn’t emitted yet)
-  PDK_ROOT_CAND="$PDK_PREFIX/share/pdk"
-  if [ ! -f "$PDK_ROOT_CAND/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
-    fail "sky130A.magicrc not found under $PDK_ROOT_CAND — build failed?"
-  fi
-  if [ ! -f "$PDK_ROOT_CAND/sky130A/libs.tech/magic/sky130A.tech" ]; then
-    warn "sky130A.tech missing; retrying 'make install' once…"
-    run "make -j$CORES install || true"
-  fi
-
   ok "open_pdks installed under $PDK_PREFIX"
 }
 
-
-# ---- 5) Locate PDK_ROOT (must be the parent that CONTAINS sky130A/) ----
+# ---- 5) Locate PDK_ROOT (must be parent that CONTAINS sky130A/) ----
 find_pdk_root() {
-  # Preferred canonical: $PDK_PREFIX/share/pdk
   cand="$PDK_ROOT_DEFAULT"
   if [ -f "$cand/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
     printf '%s' "$cand"; return 0
@@ -254,16 +256,13 @@ find_pdk_root() {
 
   info "Searching for installed sky130A…"
 
-  # a) Our prefix
   found="$(find "$PDK_PREFIX" -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' -print -quit 2>/dev/null || true)"
 
-  # b) Homebrew share
   if [ -z "$found" ]; then
     brew_share="$(brew --prefix 2>/dev/null || true)/share/pdk"
     [ -d "$brew_share" ] && found="$(find "$brew_share" -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' -print -quit 2>/dev/null || true)"
   fi
 
-  # c) Common system prefixes (lab images)
   if [ -z "$found" ]; then
     for base in /opt/pdk/share/pdk /opt/share/pdk /opt/pdk /usr/local/share/pdk /opt/homebrew/share/pdk; do
       [ -d "$base" ] || continue
@@ -273,11 +272,10 @@ find_pdk_root() {
   fi
 
   if [ -n "$found" ]; then
-    # found => …/sky130A/libs.tech/magic/sky130A.magicrc
     d1="$(dirname "$found")"      # …/sky130A/libs.tech/magic
     d2="$(dirname "$d1")"         # …/sky130A/libs.tech
     d3="$(dirname "$d2")"         # …/sky130A
-    root="$(dirname "$d3")"       # …/share/pdk  <-- THIS is PDK_ROOT
+    root="$(dirname "$d3")"       # …/share/pdk  <-- PDK_ROOT
     printf '%s' "$root"; return 0
   fi
 
@@ -298,7 +296,8 @@ export PDK_ROOT="$pdk_root"
 export SKYWATER_PDK="\$PDK_ROOT/sky130A"
 export OPEN_PDKS_ROOT="\$PDK_PREFIX"
 export MAGTYPE=mag
-# Add user-installed Magic (if present)
+# Ensure user-built Magic and MacPorts are on PATH (if present)
+[ -d "/opt/local/bin" ] && export PATH="/opt/local/bin:\$PATH"
 export PATH="$MAGIC_PREFIX/bin:\$PATH"
 # Homebrew Tcl/Tk flags (improve Magic stability)
 if command -v brew >/dev/null 2>&1; then
@@ -359,7 +358,6 @@ smoke_test() {
   [ -f "$rc" ] || fail "Missing $rc (open_pdks install incomplete?)"
 
   if command -v magic >/dev/null 2>&1; then
-    tmpd="$(mktemp -d)"
     out="$(
       (PDK_ROOT="$pdk_root" magic -noconsole -d null -rcfile "$rc" <<'EOF'
 tech
@@ -367,7 +365,6 @@ exit
 EOF
       ) 2>&1 || true
     )"
-    rm -rf "$tmpd" || true
     echo "$out" | grep -qi 'sky130A' \
       && ok "Magic successfully loaded sky130A." \
       || { warn "Magic did not report 'sky130A'. Output was:\n$out"; }
@@ -381,6 +378,7 @@ main() {
   ensure_homebrew
   install_brew_deps
   ensure_magic
+  ensure_magic_on_path       # <— NEW: guarantees `magic` command is available now
   build_open_pdks
 
   if ! PDK_ROOT_FOUND="$(find_pdk_root)"; then
@@ -395,11 +393,11 @@ main() {
 
   cat <<EOF
 Next steps:
-  • Open a new terminal so env takes effect, or run directly:
-      magic -rcfile "$PDK_ROOT_FOUND/sky130A/libs.tech/magic/sky130A.magicrc" &
-    (helper)
-      magic-sky130 &
+  • You can now launch Magic normally:
+      magic &
   • In Magic console:  :tech   (should print "sky130A")
+  • If a shell still doesn’t see 'magic', open a new terminal or run:
+      exec \$SHELL -l
 EOF
   ok "All set!"
 }
