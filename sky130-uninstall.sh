@@ -1,262 +1,248 @@
-#!/usr/bin/env bash
-# macOS SKY130 — Full Uninstaller (interactive, safe-by-default)
-# ---------------------------------------------------------------
-# Removes the SKY130A PDK tree, startup configs, and (optionally, with prompts)
-# Homebrew *and* MacPorts installs of Magic, Xschem, ngspice, Netgen, KLayout,
-# and XQuartz. It will ask before every major removal unless you pass -y.
+#!/bin/sh
+# macOS SKY130 — Full Uninstaller (POSIX sh, interactive)
+# -------------------------------------------------------
+# Removes the SKY130A PDK tree, startup configs, and (optionally) Homebrew/MacPorts
+# packages for Magic, Netgen, Xschem, ngspice, KLayout, and XQuartz.
+# Prompts before each major removal unless -y is provided.
 #
-# Examples:
-#   bash uninstall.sh                # interactive (recommended)
-#   bash uninstall.sh -y             # remove all major components without prompts
-#   bash uninstall.sh --dry-run      # show what would be removed
-#
-# Notes:
-# - This script does *not* remove Homebrew or MacPorts themselves; only packages.
-# - Some MacPorts removals require sudo. We will prompt once if needed.
+# Usage:
+#   sh uninstall.sh                # interactive
+#   sh uninstall.sh -y             # remove all without prompts
+#   sh uninstall.sh --dry-run      # show actions only
 
-set -euo pipefail
-IFS=$'
-	'
-
-info()  { printf "[1;34m[i][0m %s
-" "$*"; }
-ok()    { printf "[1;32m[✓][0m %s
-" "$*"; }
-warn()  { printf "[1;33m[!][0m %s
-" "$*"; }
-fail()  { printf "[1;31m[x][0m %s
-" "$*"; exit 1; }
+set -eu
 
 YES=false
 DRY_RUN=false
 
-while [[ $# -gt 0 ]]; do
+# --- arg parse ---
+while [ "$#" -gt 0 ]; do
   case "$1" in
-    -y|--yes) YES=true; shift ;;
-    --dry-run) DRY_RUN=true; shift ;;
+    -y|--yes) YES=true ;;
+    --dry-run) DRY_RUN=true ;;
     -h|--help)
       sed -n '1,80p' "$0"; exit 0 ;;
-    *) warn "Unknown arg: $1"; shift ;;
+    *) printf '%s
+' "[!] Unknown arg: $1" ;;
   esac
+  shift
 done
 
 confirm() {
-  local prompt="$1"
-  if $YES; then
-    return 0
+  prompt="$1"
+  if [ "$YES" = true ]; then return 0; fi
+  printf '%s [y/N]: ' "$prompt"
+  read ans || ans=""
+  [ "$ans" = "y" ] || [ "$ans" = "Y" ]
+}
+
+do_run() {
+  if [ "$DRY_RUN" = true ]; then
+    printf '%s
+' "DRY-RUN: $*"
+  else
+    # shellcheck disable=SC2086
+    sh -c "$*"
   fi
-  read -r -p "$prompt [y/N]: " ans || true
-  [[ "$ans" == "y" || "$ans" == "Y" ]]
 }
 
-run() {
-  if $DRY_RUN; then info "DRY-RUN: $*"; else eval "$*"; fi
+rm_rf() {
+  tgt="$1"
+  if [ ! -e "$tgt" ]; then printf '%s
+' "[i] Not found: $tgt"; return 0; fi
+  if [ "$DRY_RUN" = true ]; then printf '%s
+' "DRY-RUN rm -rf $tgt"; else rm -rf "$tgt"; fi
 }
 
-# Detect package managers
-BREW_BIN="$(command -v brew || true)"
-PORT_BIN="$(command -v port || true)"
+# --- detect package managers ---
+BREW_BIN=$(command -v brew 2>/dev/null || printf '')
+PORT_BIN=$(command -v port 2>/dev/null || printf '')
 
-# ---------- PDK detection (handles both $PDK_PREFIX/share/pdk and custom paths) ----------
+brew_formula_installed() {
+  [ -n "$BREW_BIN" ] && brew list --formula 2>/dev/null | grep -qx "$1"
+}
+
+brew_cask_installed() {
+  [ -n "$BREW_BIN" ] && brew list --cask 2>/dev/null | grep -qx "$1"
+}
+
+brew_uninstall_formula() {
+  pkg="$1"
+  brew_formula_installed "$pkg" || return 0
+  do_run "brew uninstall --ignore-dependencies '$pkg' || true"
+}
+
+brew_uninstall_cask() {
+  pkg="$1"
+  brew_cask_installed "$pkg" || return 0
+  do_run "brew uninstall --cask '$pkg' || true"
+}
+
+port_installed() {
+  [ -n "$PORT_BIN" ] && "$PORT_BIN" -q installed "$1" >/dev/null 2>&1
+}
+
+port_uninstall() {
+  pkg="$1"
+  port_installed "$pkg" || return 0
+  if command -v sudo >/dev/null 2>&1; then
+    do_run "sudo -n true 2>/dev/null || sudo -v"
+    do_run "sudo port -N uninstall '$pkg' || true"
+  else
+    do_run "port -N uninstall '$pkg' || true"
+  fi
+}
+
+# --- detect PDK_ROOT ---
 DEFAULT_PDK_PREFIX="$HOME/eda/pdks"
 DEFAULT_PDK_ROOT="$DEFAULT_PDK_PREFIX/share/pdk"
-PDK_ROOT_ENV="${PDK_ROOT:-}"
-PDK_PREFIX_ENV="${PDK_PREFIX:-}"
+PDK_ROOT_ENV=${PDK_ROOT-}
+PDK_PREFIX_ENV=${PDK_PREFIX-}
 
 find_pdk_root() {
-  # 1) If env points to a valid sky130A
+  # 1) env-specified
   if [ -n "$PDK_ROOT_ENV" ] && [ -f "$PDK_ROOT_ENV/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
-    printf "%s" "$PDK_ROOT_ENV"; return 0
+    printf '%s' "$PDK_ROOT_ENV"; return 0
   fi
-  # 2) Derive from PDK_PREFIX
-  local cand="${PDK_PREFIX_ENV:-$DEFAULT_PDK_PREFIX}/share/pdk"
+  # 2) derived from prefix
+  cand="${PDK_PREFIX_ENV:-$DEFAULT_PDK_PREFIX}/share/pdk"
   if [ -f "$cand/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
-    printf "%s" "$cand"; return 0
+    printf '%s' "$cand"; return 0
   fi
-  # 3) Search common prefixes
-  local found
-  for base in "$DEFAULT_PDK_PREFIX" "$HOME/eda" "$HOME/.eda-bootstrap" \
-              /opt/homebrew/share/pdk /usr/local/share/pdk; do
-    found="$(find "$base" -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' -print -quit 2>/dev/null || true)"
+  # 3) search common locations
+  for base in "$DEFAULT_PDK_PREFIX" "$HOME/eda" "$HOME/.eda-bootstrap" /opt/homebrew/share/pdk /usr/local/share/pdk; do
+    [ -d "$base" ] || continue
+    found=$(find "$base" -type f -name sky130A.magicrc -path '*/sky130A/libs.tech/magic/*' -print -quit 2>/dev/null || printf '')
     if [ -n "$found" ]; then
-      local pdk_root
-      pdk_root="$(dirname "$(dirname "$(dirname "$found")") )"
-      printf "%s" "$(dirname "$pdk_root")"
+      # walk up: magicrc -> magic -> libs.tech -> sky130A -> PDK_ROOT (its parent)
+      d1=$(dirname "$found")
+      d2=$(dirname "$d1")
+      d3=$(dirname "$d2")
+      sky=$(dirname "$d3")
+      printf '%s' "$(dirname "$sky")"
       return 0
     fi
   done
-  printf ""
+  printf '%s' ""
 }
 
-PDK_ROOT_DETECTED="$(find_pdk_root)"
-PDK_ROOT="${PDK_ROOT_DETECTED:-$DEFAULT_PDK_ROOT}"
-if [[ "$PDK_ROOT" == */share/pdk ]]; then
-  PDK_PREFIX="${PDK_ROOT%/share/pdk}"
+PDK_ROOT_DETECTED=$(find_pdk_root)
+if [ -n "$PDK_ROOT_DETECTED" ]; then
+  PDK_ROOT="$PDK_ROOT_DETECTED"
 else
-  PDK_PREFIX="${PDK_PREFIX_ENV:-$DEFAULT_PDK_PREFIX}"
+  PDK_ROOT="$DEFAULT_PDK_ROOT"
 fi
+case "$PDK_ROOT" in
+  */share/pdk) PDK_PREFIX=$(dirname "$PDK_ROOT") ;;
+  *) PDK_PREFIX="${PDK_PREFIX_ENV:-$DEFAULT_PDK_PREFIX}" ;;
+sc esac
 
-info "Detected PDK_ROOT: $PDK_ROOT"
-info "Detected PDK_PREFIX: $PDK_PREFIX"
+printf '%s
+' "[i] Using PDK_ROOT=$PDK_ROOT"
+printf '%s
+' "[i] Using PDK_PREFIX=$PDK_PREFIX"
 
-# ---------- Helpers ----------
-rmrf() {
-  local target="$1"
-  if [ ! -e "$target" ]; then warn "Not found: $target"; return 0; fi
-  if $DRY_RUN; then info "DRY-RUN rm -rf $target"; else rm -rf "$target"; fi
-}
-
-sed_delete_block() {
-  # delete lines between two markers (inclusive) in file
-  local start="$1" end="$2" file="$3"
-  [ -f "$file" ] || return 0
-  cp "$file" "${file}.bak.$(date +%Y%m%d%H%M%S)"
-  if sed --version >/dev/null 2>&1; then
-    sed -i "/$start/,/$end/d" "$file"
-  else
-    sed -i '' "/$start/,/$end/d" "$file"
-  fi
-}
-
-brew_installed_formula() { [ -n "$BREW_BIN" ] && brew list --formula 2>/dev/null | grep -qx "$1"; }
-brew_installed_cask()    { [ -n "$BREW_BIN" ] && brew list --cask    2>/dev/null | grep -qx "$1"; }
-
-brew_try_uninstall() {
-  local pkg="$1" kind="$2"  # kind: formula|cask
-  if [ -z "$BREW_BIN" ]; then return 0; fi
-  if [ "$kind" = formula ] && brew_installed_formula "$pkg"; then
-    run "brew uninstall --ignore-dependencies '$pkg' || true"
-    ok "Homebrew formula removed: $pkg"
-  elif [ "$kind" = cask ] && brew_installed_cask "$pkg"; then
-    run "brew uninstall --cask '$pkg' || true"
-    ok "Homebrew cask removed: $pkg"
-  fi
-}
-
-port_installed() { [ -n "$PORT_BIN" ] && "$PORT_BIN" -q installed "$1" >/dev/null 2>&1; }
-
-port_try_uninstall() {
-  local pkg="$1"
-  [ -z "$PORT_BIN" ] && return 0
-  if port_installed "$pkg"; then
-    if command -v sudo >/dev/null 2>&1; then
-      run "sudo -n true 2>/dev/null || sudo -v"  # prompt once
-      run "sudo port -N uninstall '$pkg' || true"
-    else
-      run "port -N uninstall '$pkg' || true"
-    fi
-    ok "MacPorts port removed: $pkg"
-  fi
-}
-
-# ---------- 1) Remove SKY130 PDK ----------
+# --- 1) Remove SKY130 PDK ---
 if [ -d "$PDK_ROOT/sky130A" ]; then
   if confirm "Remove SKY130A PDK at $PDK_ROOT/sky130A?"; then
-    rmrf "$PDK_ROOT/sky130A"
-    ok "Removed SKY130A PDK."
+    rm_rf "$PDK_ROOT/sky130A"
+    printf '%s
+' "[✓] Removed SKY130A PDK"
   else
-    warn "Kept SKY130A PDK."
+    printf '%s
+' "[!] Kept SKY130A PDK"
   fi
 else
-  warn "No SKY130A PDK directory found under $PDK_ROOT"
+  printf '%s
+' "[!] No SKY130A under $PDK_ROOT"
 fi
 
-# ---------- 2) Clean user configs (Magic/Xschem env) ----------
-if confirm "Remove Magic startup files we created (∼/.magicrc and rc_wrapper)?"; then
-  rmrf "$HOME/.config/sky130/rc_wrapper.tcl"
+# --- 2) Clean Magic configs ---
+if confirm "Remove Magic startup files we created (~/.magicrc and rc_wrapper)?"; then
+  rm_rf "$HOME/.config/sky130/rc_wrapper.tcl"
   if [ -f "$HOME/.magicrc" ] && grep -q 'SKY130A magicrc not found. Check PDK_ROOT.' "$HOME/.magicrc" 2>/dev/null; then
-    rmrf "$HOME/.magicrc"
+    rm_rf "$HOME/.magicrc"
   else
-    warn "~/.magicrc not removed (custom or not ours)."
+    printf '%s
+' "[!] ~/.magicrc looks custom; left in place"
   fi
-  ok "Cleaned Magic startup files."
-else
-  warn "Kept Magic startup files."
 fi
 
-# Remove SKY130 env block from common shells
-for zfile in "$HOME/.zprofile" "$HOME/.zshrc"; do
-  if [ -f "$zfile" ] && grep -q 'BEGIN SKY130 ENV' "$zfile" 2>/dev/null; then
-    if confirm "Strip SKY130 env block from $(basename "$zfile")?"; then
-      sed_delete_block 'BEGIN SKY130 ENV' 'END SKY130 ENV' "$zfile"
-      ok "Edited $zfile"
-    else
-      warn "Kept env block in $zfile"
+# --- 3) Remove env block from shells ---
+remove_env_block() {
+  f="$1"
+  [ -f "$f" ] || return 0
+  if grep -q 'BEGIN SKY130 ENV' "$f" 2>/dev/null; then
+    if confirm "Strip SKY130 env block from $(basename "$f")?"; then
+      cp "$f" "$f.bak.$(date +%Y%m%d%H%M%S)"
+      # BSD sed on macOS requires a backup suffix with -i
+      sed -i '' -e '/BEGIN SKY130 ENV/,/END SKY130 ENV/d' "$f"
+      printf '%s
+' "[✓] Edited $f"
     fi
   fi
-done
+}
+remove_env_block "$HOME/.zprofile"
+remove_env_block "$HOME/.zshrc"
 
-# ---------- 3) Uninstall Homebrew packages (asks per major tool) ----------
+# --- 4) Homebrew packages ---
 if [ -n "$BREW_BIN" ]; then
-  info "Checking Homebrew packages…"
-  # Some setups use 'magic', others 'magic-netgen'; handle both.
-  if brew_installed_formula magic || brew_installed_formula magic-netgen; then
+  printf '%s
+' "[i] Homebrew detected: $(brew --prefix 2>/dev/null || printf '')"
+  # Magic (could be magic or magic-netgen)
+  if brew_formula_installed magic || brew_formula_installed magic-netgen; then
     if confirm "Uninstall Magic (Homebrew)?"; then
-      brew_try_uninstall magic formula
-      brew_try_uninstall magic-netgen formula
+      brew_uninstall_formula magic
+      brew_uninstall_formula magic-netgen
     fi
   fi
-  if brew_installed_formula netgen; then
-    if confirm "Uninstall Netgen (Homebrew)?"; then
-      brew_try_uninstall netgen formula
-    fi
+  if brew_formula_installed netgen && confirm "Uninstall Netgen (Homebrew)?"; then
+    brew_uninstall_formula netgen
   fi
-  if brew_installed_formula xschem; then
-    if confirm "Uninstall Xschem (Homebrew)?"; then
-      brew_try_uninstall xschem formula
-    fi
+  if brew_formula_installed xschem && confirm "Uninstall Xschem (Homebrew)?"; then
+    brew_uninstall_formula xschem
   fi
-  if brew_installed_formula ngspice; then
-    if confirm "Uninstall ngspice (Homebrew)?"; then
-      brew_try_uninstall ngspice formula
-    fi
+  if brew_formula_installed ngspice && confirm "Uninstall ngspice (Homebrew)?"; then
+    brew_uninstall_formula ngspice
   fi
-  # KLayout is sometimes a formula, sometimes a cask
-  if brew_installed_formula klayout || brew_installed_cask klayout; then
+  if brew_formula_installed klayout || brew_cask_installed klayout; then
     if confirm "Uninstall KLayout (Homebrew)?"; then
-      brew_try_uninstall klayout formula
-      brew_try_uninstall klayout cask
+      brew_uninstall_formula klayout
+      brew_uninstall_cask klayout
     fi
   fi
-  if brew_installed_cask xquartz; then
-    if confirm "Uninstall XQuartz (Homebrew cask)?"; then
-      brew_try_uninstall xquartz cask
-    fi
+  if brew_cask_installed xquartz && confirm "Uninstall XQuartz (Homebrew cask)?"; then
+    brew_uninstall_cask xquartz
   fi
 else
-  warn "Homebrew not detected; skipping brew removals."
+  printf '%s
+' "[!] Homebrew not detected; skipping brew removals"
 fi
 
-# ---------- 4) Uninstall MacPorts packages (asks per major tool) ----------
+# --- 5) MacPorts packages ---
 if [ -n "$PORT_BIN" ]; then
-  info "Checking MacPorts ports…"
-  for portname in magic netgen xschem ngspice klayout open_pdks openpdks open_pdks-sky130; do
-    if port_installed "$portname" && confirm "Uninstall $portname (MacPorts)?"; then
-      port_try_uninstall "$portname"
+  printf '%s
+' "[i] MacPorts detected: $PORT_BIN"
+  for p in magic netgen xschem ngspice klayout open_pdks openpdks open_pdks-sky130; do
+    if port_installed "$p" && confirm "Uninstall $p (MacPorts)?"; then
+      port_uninstall "$p"
     fi
   done
-  # XQuartz equivalent in MacPorts is usually xorg-server (rarely used on recent macOS)
   if port_installed xorg-server && confirm "Uninstall xorg-server (MacPorts)?"; then
-    port_try_uninstall xorg-server
+    port_uninstall xorg-server
   fi
 else
-  warn "MacPorts not detected; skipping MacPorts removals."
+  printf '%s
+' "[!] MacPorts not detected; skipping ports removals"
 fi
 
-# ---------- 5) Remove source trees / caches ----------
+# --- 6) Remove sources / caches ---
 if confirm "Remove source/cache directories (~/eda/src/open_pdks, ~/.eda-bootstrap)?"; then
-  rmrf "$HOME/eda/src/open_pdks"
-  rmrf "$HOME/.eda-bootstrap"
-  ok "Removed source/cache directories."
-else
-  warn "Kept source/cache directories."
+  rm_rf "$HOME/eda/src/open_pdks"
+  rm_rf "$HOME/.eda-bootstrap"
 fi
 
-ok "Uninstall flow complete. Open a new terminal to use a clean environment."
-
-cat <<'POSTHINT'
-Hints:
-- If Magic still auto-loads a tech, check for a project-local .magicrc in your design folders.
-- To fully clear env in *this* shell session: unset PDK_ROOT PDK_PREFIX SKYWATER_PDK OPEN_PDKS_ROOT MAGTYPE
-- You can reinstall later with scripts/install-mac.sh
-POSTHINT
+printf '%s
+' "[✓] Uninstall flow complete. Open a new terminal for a clean env."
+printf '%s
+' "Hints: If Magic still loads a tech, check for project-local .magicrc files."
