@@ -227,25 +227,35 @@ build_open_pdks() {
   info "Building and installing open_pdks (sky130A)…"
   mkdir -p "$SRC_ROOT" "$PDK_PREFIX"
   cd "$SRC_ROOT"
-  if [ ! -d open_pdks ]; then
-    run "git clone https://github.com/RTimothyEdwards/open_pdks.git"
-  fi
+
+  [ -d open_pdks ] || run "git clone https://github.com/RTimothyEdwards/open_pdks.git"
   cd open_pdks
-  run "git fetch --all -q && git pull -q"
+
+  run "git fetch -q --all"
+  run "git reset -q --hard"
+  run "git clean -xfd -q"
   run "make distclean || true"
-  run "git clean -xfd -q || true"
+
   TCLTK_PREFIX="$(brew --prefix tcl-tk 2>/dev/null || true)"
   if [ -n "$TCLTK_PREFIX" ]; then
     export LDFLAGS="-L$TCLTK_PREFIX/lib ${LDFLAGS-}"
     export CPPFLAGS="-I$TCLTK_PREFIX/include ${CPPFLAGS-}"
     export PKG_CONFIG_PATH="$TCLTK_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   fi
+
+  # Ensure magic is on PATH (needed to generate Magic tech files)
   PATH="$MAGIC_PREFIX/bin:$PATH"; export PATH
-  run "./configure --prefix='$PDK_PREFIX' --enable-sky130-pdk --with-sky130-variants=A --disable-gf180mcu-pdk"
+
+  run "./configure --prefix='$PDK_PREFIX' \
+       --enable-sky130-pdk --with-sky130-variants=A \
+       --disable-gf180mcu-pdk"
+
   run "make -j$CORES"
   run "make -j$CORES install"
+
   ok "open_pdks installed under $PDK_PREFIX"
 }
+
 
 # ---- 5) Locate PDK_ROOT (must be parent that CONTAINS sky130A/) ----
 find_pdk_root() {
@@ -373,11 +383,10 @@ EOF
   fi
 }
 
-# ---- VERIFY + AUTO-FIX SKY130 LOADING (includes /opt/local) ----
+# ---- VERIFY + AUTO-FIX SKY130 LOADING (no MacPorts fallback) ----
 ensure_sky130_loaded_and_fix() {
   info "Verifying Magic loads SKY130A…"
 
-  # Need magic to test
   if ! command -v magic >/dev/null 2>&1; then
     warn "Magic not on PATH yet — skipping SKY130 load check."
     return 0
@@ -386,7 +395,7 @@ ensure_sky130_loaded_and_fix() {
   FOUND_RC=""
   PDK_ROOT_FIX=""
 
-  # Candidate PDK_ROOTs to try (env, user prefix, brew, system, macports)
+  # Candidate PDK_ROOTs to try (env, user prefix, brew, system, macports share)
   CAND_ROOTS="
 ${PDK_ROOT-}
 $PDK_PREFIX/share/pdk
@@ -398,7 +407,6 @@ $(command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null)/share/pdk
 /opt/local/share/pdk
 "
 
-  # Try quick candidates first
   for r in $CAND_ROOTS; do
     [ -n "$r" ] || continue
     [ -f "$r/sky130A/libs.tech/magic/sky130A.magicrc" ] || continue
@@ -407,36 +415,43 @@ $(command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null)/share/pdk
     break
   done
 
-  # Wider search (also include /opt/local now)
+  # Wider search (HOME + common system prefixes incl. /opt/local)
   if [ -z "$FOUND_RC" ]; then
-    FOUND_RC="$(/usr/bin/find "$HOME" /opt /opt/local /usr/local /opt/homebrew \
-      -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' -print -quit 2>/dev/null || true)"
+    FOUND_RC="$(
+      /usr/bin/find "$HOME" /opt /opt/local /usr/local /opt/homebrew \
+        -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' \
+        -print -quit 2>/dev/null || true
+    )"
     if [ -n "$FOUND_RC" ]; then
-      d1="$(dirname "$FOUND_RC")"   # …/sky130A/libs.tech/magic
-      d2="$(dirname "$d1")"         # …/sky130A/libs.tech
-      d3="$(dirname "$d2")"         # …/sky130A
-      PDK_ROOT_FIX="$(dirname "$d3")"  # …/share/pdk
+      d1="$(dirname "$FOUND_RC")"; d2="$(dirname "$d1")"; d3="$(dirname "$d2")"
+      PDK_ROOT_FIX="$(dirname "$d3")"   # …/share/pdk
     fi
   fi
 
-  # Optional fallback: install open_pdks via MacPorts if available and nothing found
-  if [ -z "$FOUND_RC" ] && command -v port >/dev/null 2>&1; then
-    if confirm "SKY130 PDK not found. Install open_pdks via MacPorts now? (admin required)"; then
-      if sudo -n true 2>/dev/null; then :; else
-        printf "%s\n" "[sudo] may prompt for your password…" >&2
-        sudo -v
-      fi
-      run "sudo ${PORT_BIN:-/opt/local/bin/port} -N install open_pdks || true"
-      if [ -f /opt/local/share/pdk/sky130A/libs.tech/magic/sky130A.magicrc ]; then
-        FOUND_RC="/opt/local/share/pdk/sky130A/libs.tech/magic/sky130A.magicrc"
-        PDK_ROOT_FIX="/opt/local/share/pdk"
-      fi
+  # If still not found, (re)build open_pdks from source and re-scan.
+  if [ -z "$FOUND_RC" ]; then
+    warn "SKY130 PDK not found. Rebuilding open_pdks from source…"
+    build_open_pdks    # <-- your existing source build function
+    # Re-scan once
+    if [ -f "$PDK_PREFIX/share/pdk/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
+      FOUND_RC="$PDK_PREFIX/share/pdk/sky130A/libs.tech/magic/sky130A.magicrc"
+      PDK_ROOT_FIX="$PDK_PREFIX/share/pdk"
+    else
+      FOUND_RC="$(
+        /usr/bin/find "$HOME" /opt /opt/local /usr/local /opt/homebrew \
+          -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' \
+          -print -quit 2>/dev/null || true
+      )"
+      [ -n "$FOUND_RC" ] && {
+        d1="$(dirname "$FOUND_RC")"; d2="$(dirname "$d1")"; d3="$(dirname "$d2")"
+        PDK_ROOT_FIX="$(dirname "$d3")"
+      }
     fi
   fi
 
-  [ -n "$FOUND_RC" ] || fail "Could not locate sky130A.magicrc anywhere. open_pdks install may have failed."
+  [ -n "$FOUND_RC" ] || fail "Could not locate sky130A.magicrc anywhere. The open_pdks build likely failed. See logs above."
 
-  # Headless test (load via rc; do NOT pass -T)
+  # Headless test (load via rc; do NOT pass -T). Magic must be present for tech gen. :contentReference[oaicite:1]{index=1}
   OUT="$(
     (PDK_ROOT="$PDK_ROOT_FIX" magic -noconsole -d null -rcfile "$FOUND_RC" <<'EOF'
 tech
@@ -452,7 +467,7 @@ EOF
 
   warn "Magic did not report 'sky130A'. Auto-fixing env and rc…"
 
-  # Write robust ~/.magicrc that sources through PDK_ROOT
+  # Robust ~/.magicrc that sources via PDK_ROOT
   cat > "$HOME/.magicrc" <<'EOF'
 # Minimal, robust Magic startup for SKY130A
 if { [info exists env(PDK_ROOT)] && \
@@ -464,10 +479,9 @@ if { [info exists env(PDK_ROOT)] && \
 EOF
   ok "~/.magicrc updated."
 
-  # Patch ~/.zprofile with the corrected PDK_ROOT
+  # Patch ~/.zprofile with corrected PDK_ROOT block
   ZFILE="$HOME/.zprofile"
   cp "$ZFILE" "$ZFILE.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-  # delete old block if present (your script already has delete_block_in_file)
   delete_block_in_file 'BEGIN SKY130 ENV' 'END SKY130 ENV' "$ZFILE"
   {
     echo ""
@@ -505,6 +519,7 @@ EOF
     warn "Re-test did not report 'sky130A'. Output was:\n$OUT"
   fi
 }
+
 
 
 main() {
