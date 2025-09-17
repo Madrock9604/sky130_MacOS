@@ -2,11 +2,10 @@
 # macOS SKY130 — One-Shot Installer (POSIX sh, general/robust)
 # -----------------------------------------------------------
 # After this finishes, Magic will launch with SKY130A on a clean macOS.
-# Safe improvements vs your prior script:
-#   • Broader PDK detection (/opt, /opt/pdk, brew share, user prefixes)
-#   • Headless smoke test no longer uses `-T sky130A` (avoids false failures)
-#   • Sets PDK_ROOT for the test command even if shell env isn’t reloaded yet
-#   • Optional `magic-sky130` helper (additive; doesn’t change current flow)
+# Key robustness:
+#   • Broader PDK detection (/opt, /opt/pdk, Homebrew share, user prefixes)
+#   • Headless smoke test loads via PDK rc only (no `-T sky130A`)
+#   • Sets PDK_ROOT for the test even before you open a new terminal
 
 set -eu
 
@@ -30,10 +29,10 @@ ok()   { printf "\033[1;32m[✓]\033[0m %s\n" "$*"; }
 warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
 fail() { printf "\033[1;31m[x]\033[0m %s\n" "$*"; exit 1; }
 
+# read Y/N even if script is piped via curl
 confirm() {
   prompt="$1"
   if [ "$YES" = true ]; then return 0; fi
-  # read from real TTY so it works even when piped
   if [ -t 0 ]; then
     printf '%s [y/N]: ' "$prompt"
     read ans || ans=""
@@ -69,14 +68,14 @@ ensure_xcode() {
   if ! xcode-select -p >/dev/null 2>&1; then
     info "Installing Xcode Command Line Tools…"
     run "xcode-select --install || true"
-    warn "If a dialog appeared, complete it, then re-run this script."
+    warn "If a dialog appeared, finish it, then re-run this script."
   fi
   ok "Xcode Command Line Tools present."
 }
 
 # ---- 1) Homebrew (for deps) ----
 ensure_homebrew() {
-  # Homebrew refuses to run as root
+  # Homebrew refuses to install as root
   if [ "$(id -u)" -eq 0 ]; then
     fail "Homebrew cannot be installed as root. Re-run as a normal user (no sudo)."
   fi
@@ -141,7 +140,6 @@ install_brew_deps() {
 install_magic_via_macports() {
   [ -n "$PORT_BIN" ] || return 1
   info "Installing Magic via MacPorts…"
-  # request sudo cleanly (TTY or GUI)
   if sudo -n true 2>/dev/null; then :; else
     printf "%s\n" "[sudo] may prompt for your password…" >&2
     sudo -v
@@ -218,24 +216,26 @@ build_open_pdks() {
   ok "open_pdks installed under $PDK_PREFIX"
 }
 
-# ---- 5) Locate PDK_ROOT ----
+# ---- 5) Locate PDK_ROOT (must be the parent that CONTAINS sky130A/) ----
 find_pdk_root() {
-  # Preferred canonical
+  # Preferred canonical: $PDK_PREFIX/share/pdk
   cand="$PDK_ROOT_DEFAULT"
   if [ -f "$cand/sky130A/libs.tech/magic/sky130A.magicrc" ]; then
     printf '%s' "$cand"; return 0
   fi
 
-  # Search within our prefixes
   info "Searching for installed sky130A…"
-  # a) PDK_PREFIX tree
+
+  # a) Our prefix
   found="$(find "$PDK_PREFIX" -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' -print -quit 2>/dev/null || true)"
+
   # b) Homebrew share
   if [ -z "$found" ]; then
     brew_share="$(brew --prefix 2>/dev/null || true)/share/pdk"
-    [ -n "$brew_share" ] && found="$(find "$brew_share" -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' -print -quit 2>/dev/null || true)"
+    [ -d "$brew_share" ] && found="$(find "$brew_share" -type f -path '*/sky130A/libs.tech/magic/sky130A.magicrc' -print -quit 2>/dev/null || true)"
   fi
-  # c) Common system prefixes, e.g., /opt/pdk/share/pdk from labs
+
+  # c) Common system prefixes (lab images)
   if [ -z "$found" ]; then
     for base in /opt/pdk/share/pdk /opt/share/pdk /opt/pdk /usr/local/share/pdk /opt/homebrew/share/pdk; do
       [ -d "$base" ] || continue
@@ -245,10 +245,14 @@ find_pdk_root() {
   fi
 
   if [ -n "$found" ]; then
-    # …/sky130A/libs.tech/magic/sky130A.magicrc -> PDK_ROOT (parent that contains sky130A/)
-    d1="$(dirname "$found")"; d2="$(dirname "$d1")"; d3="$(dirname "$d2")"; sky="$(dirname "$d3")"
-    printf '%s' "$(dirname "$sky")"; return 0
+    # found => …/sky130A/libs.tech/magic/sky130A.magicrc
+    d1="$(dirname "$found")"      # …/sky130A/libs.tech/magic
+    d2="$(dirname "$d1")"         # …/sky130A/libs.tech
+    d3="$(dirname "$d2")"         # …/sky130A
+    root="$(dirname "$d3")"       # …/share/pdk  <-- THIS is PDK_ROOT
+    printf '%s' "$root"; return 0
   fi
+
   return 1
 }
 
@@ -298,7 +302,7 @@ EOF
   ok "~/.magicrc configured."
 }
 
-# (Optional) handy launcher that never depends on shell env
+# (Optional) helper that never depends on the shell env
 install_magic_wrapper() {
   bin="$MAGIC_PREFIX/bin"
   mkdir -p "$bin"
@@ -308,7 +312,6 @@ install_magic_wrapper() {
 set -eu
 PDK_ROOT_GUESS="${PDK_ROOT:-}"
 if [ -z "$PDK_ROOT_GUESS" ]; then
-  # common locations
   for b in "$HOME/eda/pdks/share/pdk" /opt/pdk/share/pdk /usr/local/share/pdk /opt/homebrew/share/pdk; do
     if [ -f "$b/sky130A/libs.tech/magic/sky130A.magicrc" ]; then PDK_ROOT_GUESS="$b"; break; fi
   done
@@ -320,16 +323,14 @@ EOF
   ok "Installed helper: $bin/magic-sky130"
 }
 
-# ---- 7) Robust smoke test ----
+# ---- 7) Robust smoke test (rc-only) ----
 smoke_test() {
   pdk_root="$1"
   rc="$pdk_root/sky130A/libs.tech/magic/sky130A.magicrc"
-  info "Running headless Magic smoke test (load via PDK rc)…"
+  info "Running headless Magic smoke test (via PDK rc)…"
   [ -f "$rc" ] || fail "Missing $rc (open_pdks install incomplete?)"
 
   if command -v magic >/dev/null 2>&1; then
-    # Run in a clean temp dir, set PDK_ROOT explicitly for this process,
-    # DO NOT pass -T. Ask Magic which tech is loaded.
     tmpd="$(mktemp -d)"
     out="$(
       (PDK_ROOT="$pdk_root" magic -noconsole -d null -rcfile "$rc" <<'EOF'
@@ -343,7 +344,7 @@ EOF
       && ok "Magic successfully loaded sky130A." \
       || { warn "Magic did not report 'sky130A'. Output was:\n$out"; }
   else
-    warn "Magic not in PATH yet. Open a new terminal (env persisted) or run: $MAGIC_PREFIX/bin/magic-sky130"
+    warn "Magic not in PATH yet. Open a new terminal (env persisted) or run: magic -rcfile \"$rc\" &"
   fi
 }
 
@@ -354,7 +355,6 @@ main() {
   ensure_magic
   build_open_pdks
 
-  # locate PDK root robustly
   if ! PDK_ROOT_FOUND="$(find_pdk_root)"; then
     fail "Could not locate installed sky130A. Check build logs above."
   fi
@@ -362,15 +362,16 @@ main() {
 
   persist_env "$PDK_ROOT_FOUND"
   write_magic_rc
-  install_magic_wrapper   # additive convenience; does not change default flow
+  install_magic_wrapper
   smoke_test "$PDK_ROOT_FOUND"
 
   cat <<EOF
 Next steps:
   • Open a new terminal so env takes effect, or run directly:
       magic -rcfile "$PDK_ROOT_FOUND/sky130A/libs.tech/magic/sky130A.magicrc" &
-    (or use helper) 
+    (helper)
       magic-sky130 &
+  • In Magic console:  :tech   (should print "sky130A")
 EOF
   ok "All set!"
 }
