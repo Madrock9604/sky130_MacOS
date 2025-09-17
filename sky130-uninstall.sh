@@ -1,30 +1,32 @@
 #!/bin/sh
-# macOS SKY130 — Full Uninstaller (POSIX sh, interactive)
-# -------------------------------------------------------
+# macOS SKY130 — Full Uninstaller (POSIX sh, interactive, elevating)
+# ------------------------------------------------------------------
 # Removes the SKY130A PDK tree, startup configs, and (optionally) Homebrew/MacPorts
 # packages for Magic, Netgen, Xschem, ngspice, KLayout, and XQuartz.
-# Prompts before each major removal unless -y is provided.
-# Now proactively prompts for admin rights when MacPorts removals need them.
+# - Prompts before each major removal unless -y is provided.
+# - Elevates reliably for MacPorts using sudo (TTY) or a GUI password dialog (no TTY).
 #
 # Usage:
-#   sh uninstall.sh                # interactive
-#   sh uninstall.sh -y             # remove all without prompts
-#   sh uninstall.sh --dry-run      # show actions only
+#   sh sky130-uninstall.sh                # interactive
+#   sh sky130-uninstall.sh -y             # auto-yes (no prompts)
+#   sh sky130-uninstall.sh --dry-run      # preview actions (no changes)
+#
+# Tip (run via curl):
+#   curl -fsSL <raw-url>/sky130-uninstall.sh | sh -s -- -y
 
 set -eu
 
 YES=false
 DRY=false
 
-# --- arg parse ---
+# --- argument parsing ---
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -y|--yes) YES=true ;;
-    --dry-run) DRY=true ;;
-    -h|--help)
-      sed -n '1,120p' "$0"; exit 0 ;;
-    *) printf '%s
-' "[!] Unknown arg: $1" ;;
+    -y|--yes)   YES=true ;;
+    --dry-run)  DRY=true ;;
+    -h|--help)  sed -n '1,200p' "$0"; exit 0 ;;
+    *)          printf '[!] Unknown arg: %s
+' "$1" ;;
   esac
   shift
 done
@@ -48,59 +50,54 @@ rmrf() { [ -e "$1" ] || { printf '[i] Not found: %s
 BREW_BIN=$(command -v brew 2>/dev/null || printf '')
 PORT_BIN=$(command -v port 2>/dev/null || printf '')
 
-# --- sudo helpers (for MacPorts) ---
-ensure_sudo() {
-  if [ -n "$SUDO_ASKPASS" ]; then
-    sudo -A -v || { printf '%s
-' "[x] Could not obtain admin privileges (sudo)."; exit 1; }
+# --- elevation helpers (MacPorts needs admin) ---
+HAS_TTY=0; [ -t 1 ] && HAS_TTY=1
+sudo_ticket_valid() { sudo -n true 2>/dev/null; }
+
+# Run a command with admin rights
+# - With a TTY: prompt once via sudo and reuse ticket
+# - Without a TTY (e.g., curl | sh): show GUI password dialog via AppleScript
+run_admin() {
+  _cmd="$1"
+  if [ "$DRY" = true ]; then
+    if [ "$HAS_TTY" -eq 1 ]; then printf 'DRY-RUN sudo %s
+' "$_cmd"; else printf 'DRY-RUN (GUI sudo) %s
+' "$_cmd"; fi
+    return 0
+  fi
+  if [ "$HAS_TTY" -eq 1 ]; then
+    sudo_ticket_valid || sudo -v || { printf '[x] Could not obtain admin privileges.
+'; exit 1; }
+    sh -c "sudo $_cmd"
   else
-    sudo -v    || { printf '%s
-' "[x] Could not obtain admin privileges (sudo)."; exit 1; }
+    # Escape for AppleScript (handles quotes and backslashes)
+    _esc=$(printf '%s' "$_cmd" | sed 's/\/\\/g; s/"/\"/g')
+    /usr/bin/osascript -e "do shell script \"$_esc\" with administrator privileges"
   fi
 }
 
-sudo_ticket_valid() { sudo -n true 2>/dev/null; }
-
-# Determine MacPorts prefix (defaults to /opt/local)
-PORT_PREFIX="/opt/local"
-if [ -n "$PORT_BIN" ]; then
-  PORT_PREFIX=$($PORT_BIN -q prefix 2>/dev/null || printf '/opt/local')
-fi
-
-macports_needs_admin() {
-  # If we cannot write to the prefix, we need sudo
-  [ -w "$PORT_PREFIX" ] && [ -w "$PORT_PREFIX/var/macports" ] || return 0
-  return 1
-}
-
-# --- brew helpers ---
+# --- Homebrew helpers ---
 brew_formula_installed() { [ -n "$BREW_BIN" ] && brew list --formula 2>/dev/null | grep -qx "$1"; }
 brew_cask_installed()    { [ -n "$BREW_BIN" ] && brew list --cask    2>/dev/null | grep -qx "$1"; }
 
 brew_uninstall_formula() {
-  pkg="$1"
-  brew_formula_installed "$pkg" || return 0
+  pkg="$1"; brew_formula_installed "$pkg" || return 0
   run "brew uninstall --ignore-dependencies '$pkg' || true"
 }
 
 brew_uninstall_cask() {
-  pkg="$1"
-  brew_cask_installed "$pkg" || return 0
+  pkg="$1"; brew_cask_installed "$pkg" || return 0
   run "brew uninstall --cask '$pkg' || true"
 }
 
-# --- ports helpers ---
+# --- MacPorts helpers (always elevate) ---
 port_installed() { [ -n "$PORT_BIN" ] && "$PORT_BIN" -q installed "$1" >/dev/null 2>&1; }
 
 port_uninstall() {
-  pkg="$1"
-  port_installed "$pkg" || return 0
-  if macports_needs_admin || ! sudo_ticket_valid; then
-    printf '%s
-' "[i] Admin privileges required to modify MacPorts. You'll be prompted once."
-    ensure_sudo
-  fi
-  run "sudo ${PORT_BIN:-port} -N uninstall '$pkg' || true"
+  _pkg="$1"
+  port_installed "$_pkg" || return 0
+  _port_bin="${PORT_BIN:-/opt/local/bin/port}"
+  run_admin "'$_port_bin' -N uninstall '$_pkg' || true"
 }
 
 # --- detect PDK_ROOT ---
@@ -176,8 +173,7 @@ fi
 
 # --- 3) Remove env block from shells ---
 strip_env() {
-  f="$1"
-  [ -f "$f" ] || return 0
+  f="$1"; [ -f "$f" ] || return 0
   if grep -q 'BEGIN SKY130 ENV' "$f" 2>/dev/null; then
     if confirm "Strip SKY130 env block from $(basename "$f")?"; then
       cp "$f" "$f.bak.$(date +%Y%m%d%H%M%S)"
@@ -194,6 +190,7 @@ strip_env "$HOME/.zshrc"
 if [ -n "$BREW_BIN" ]; then
   printf '%s
 ' "[i] Homebrew detected: $(brew --prefix 2>/dev/null || printf '')"
+  # Magic (sometimes packaged as magic-netgen)
   if brew_formula_installed magic || brew_formula_installed magic-netgen; then
     if confirm "Uninstall Magic (Homebrew)?"; then
       brew_uninstall_formula magic
@@ -223,10 +220,10 @@ else
 ' "[!] Homebrew not detected; skipping brew removals"
 fi
 
-# --- 5) MacPorts packages (with sudo prompt when required) ---
+# --- 5) MacPorts packages (always elevate; GUI prompt if needed) ---
 if [ -n "$PORT_BIN" ]; then
   printf '%s
-' "[i] MacPorts detected: $PORT_BIN (prefix: $PORT_PREFIX)"
+' "[i] MacPorts detected: $PORT_BIN"
   for p in magic netgen xschem ngspice klayout open_pdks openpdks open_pdks-sky130; do
     if port_installed "$p" && confirm "Uninstall $p (MacPorts)?"; then
       port_uninstall "$p"
@@ -247,6 +244,6 @@ if confirm "Remove source/cache directories (~/eda/src/open_pdks, ~/.eda-bootstr
 fi
 
 printf '%s
-' "[✓] Uninstall flow complete. Open a new terminal for a clean env."
+' "[✓] Uninstall complete. Open a new terminal for a clean environment."
 printf '%s
 ' "Hints: If Magic still loads a tech, check for project-local .magicrc files."
