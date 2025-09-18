@@ -1,52 +1,59 @@
 #!/usr/bin/env bash
+# Build & install Magic from source (Homebrew + XQuartz), isolated under ~/.eda/sky130
 set -euo pipefail
 IFS=$'\n\t'
 
-
+# ===== Config =====
 EDA_ROOT="${EDA_ROOT:-$HOME/.eda/sky130}"
 SRC_DIR="${SRC_DIR:-$EDA_ROOT/src}"
 BIN_DIR="$EDA_ROOT/bin"
-MAGIC_REF="${MAGIC_REF:-master}" # use a tag/commit if you want determinism
+MAGIC_REF="${MAGIC_REF:-master}"   # set to a tag/commit for reproducible builds
 
-
-if command -v brew >/dev/null 2>&1; then eval "$($(command -v brew) shellenv)"; fi
-BREW_PREFIX=$(brew --prefix)
-
+# ===== Prep =====
+# Bring Homebrew into PATH for this non-interactive shell
+if command -v brew >/dev/null 2>&1; then
+  eval "$($(command -v brew) shellenv)"
+else
+  echo "[ERR] Homebrew not found. Run 00_prereqs_mac.sh first." >&2
+  exit 1
+fi
+BREW_PREFIX="$(brew --prefix)"
 
 mkdir -p "$SRC_DIR" "$BIN_DIR"
 cd "$SRC_DIR"
 
-
+# ===== Clone (or reuse) repo =====
 if [ ! -d magic ]; then
-echo "[INFO] Cloning magic…"
-git clone --depth=1 --branch "$MAGIC_REF" https://github.com/RTimothyEdwards/magic.git
+  echo "[INFO] Cloning magic ($MAGIC_REF)…"
+  git clone --depth=1 --branch "$MAGIC_REF" https://github.com/RTimothyEdwards/magic.git
 fi
-cd magic
+MAGIC_DIR="$SRC_DIR/magic"
+cd "$MAGIC_DIR"
 
-
-# Configure with Tcl/Tk from Homebrew and XQuartz headers/libs
-# (safe under: set -euo pipefail)
+# ===== Build flags (nounset-safe) =====
+# PKG_CONFIG_PATH (prepend brew tcl-tk)
 if [ -n "${PKG_CONFIG_PATH-}" ]; then
   export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig:$PKG_CONFIG_PATH"
 else
   export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig"
 fi
 
-# Base includes (Brew Tcl/Tk + XQuartz)
+# Base includes for Brew Tcl/Tk + XQuartz
 CPPBASE="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include"
-# *** Key fix: add src-relative includes for subdir builds (commands/, cmwind/, etc.) ***
+# Key: src-relative includes so subdir builds (commands/, cmwind/, etc.) find ../database
 CPPREL="-I. -I.. -I../.."
 
 # Apply to BOTH CPPFLAGS and CFLAGS (some sub-makefiles ignore CPPFLAGS)
 export CPPFLAGS="$CPPBASE $CPPREL ${CPPFLAGS-}"
 export CFLAGS="$CPPBASE $CPPREL ${CFLAGS-}"
-
 export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS-}"
 
-# Ensure a clean tree in case of previous failed builds
+# ===== Clean tree (important after failed attempts) =====
 git reset --hard
 git clean -xfd
 
+# ===== Configure =====
+echo "[INFO] Configuring magic…"
 ./configure \
   --prefix="$EDA_ROOT/opt/magic" \
   --with-tcl="$BREW_PREFIX/opt/tcl-tk/lib" \
@@ -55,22 +62,31 @@ git clean -xfd
   --x-libraries=/opt/X11/lib \
   --enable-cairo
 
-# --- PRE-BUILD: force-generate the auto header to avoid race conditions ---
-# Some parallel builds start compiling subdirs before database/database.h exists.
-# This ensures the header is present first, then we'll run the full build.
-make -C src database/database.h || ( cd src && ./scripts/makedbh ./database/database.h.in database/database.h )
+# ===== Pre-generate auto header to avoid parallel build race =====
+# Some parallel builds start compiling before src/database/database.h exists.
+if [ ! -f "src/database/database.h" ]; then
+  echo "[INFO] Pre-generating src/database/database.h …"
+  # Call generator with explicit paths (no cd into src)
+  sh "src/scripts/makedbh" "src/database/database.h.in" "src/database/database.h"
+fi
+[ -f "src/database/database.h" ] || { echo "[ERR] Failed to generate src/database/database.h"; exit 1; }
 
-# Optional: verify it exists (fail early if not)
-[ -f src/database/database.h ] || { echo "[ERR] src/database/database.h not generated"; exit 1; }
+# ===== Build & install =====
+echo "[INFO] Building magic…"
+make -j"$(( $(/usr/sbin/sysctl -n hw.ncpu) ))"
 
-# Now do the full (parallel) build
-make -j"$(/usr/sbin/sysctl -n hw.ncpu)"
+echo "[INFO] Installing magic to $EDA_ROOT/opt/magic …"
 make install
 
+# ===== Symlink into isolated bin =====
+mkdir -p "$BIN_DIR"
 ln -sf "$EDA_ROOT/opt/magic/bin/magic" "$BIN_DIR/magic"
 
+# ===== Headless sanity check (don’t fail hard if GUI-only env) =====
+if "$EDA_ROOT/opt/magic/bin/magic" -dnull -noconsole -rcfile /dev/null -e 'quit' >/dev/null 2>&1; then
+  echo "[OK ] Magic headless check passed"
+else
+  echo "[WARN] Magic installed, but headless check failed (GUI likely fine)."
+fi
 
-# Headless sanity check
-"$EDA_ROOT/opt/magic/bin/magic" -dnull -noconsole -rcfile /dev/null -e 'quit' >/dev/null 2>&1 && \
-echo "[OK ] magic installed: $($EDA_ROOT/opt/magic/bin/magic -v | head -n1)" || \
-echo "[WARN] magic installed, but headless check failed (GUI likely fine)."
+echo "[OK ] Magic build finished. Try: magic &    (or later: magic-sky130 after PDK)"
