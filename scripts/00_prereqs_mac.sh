@@ -64,22 +64,42 @@ ok "Base packages installed."
 
 # ===== Activate script (keeps env isolated; no global changes unless opted in) =====
 ACTIVATE="$EDA_ROOT/activate"
-log "Writing isolated environment activator: $ACTIVATE"
+echo "[INFO] Writing isolated environment activator: $ACTIVATE"
 cat >"$ACTIVATE" <<'EOF'
 # Source this file to enter the EDA env
-# $ source ~/.eda/sky130/activate
-
+#   $ source ~/.eda/sky130/activate
 
 # Detect Homebrew
 if command -v brew >/dev/null 2>&1; then
-eval "$($(command -v brew) shellenv)"
+  eval "$($(command -v brew) shellenv)"
 fi
+
 export EDA_ROOT="${EDA_ROOT:-$HOME/.eda/sky130}"
-export PDK_ROOT="${PDK_ROOT:-$EDA_ROOT/pdks}"
+export PDK_ROOT="$EDA_ROOT/pdks"     # force isolated PDK path
 export PDK="${PDK:-sky130A}"
 
+# Prefer Brew's Tcl/Tk and XQuartz headers/libs for builds
+BREW_PREFIX=$(brew --prefix 2>/dev/null || echo "/opt/homebrew")
+export PATH="$EDA_ROOT/bin:$PATH"
+export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig${PKG_CONFIG_PATH:+:}$PKG_CONFIG_PATH"
+export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS:-}"
+export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS:-}"
 
-# Prefer Brew's tcl-tk and XQuartz headers/libs for builds
-ok "Prereqs done. You can now run component installers."
+# X11 display; XQuartz usually sets this automatically
+export DISPLAY="${DISPLAY:-:0}"
+
+# Magic / Xschem integration with SKY130
+export MAGICRC="$PDK_ROOT/$PDK/libs.tech/magic/$PDK.magicrc"
+export XSCHEM_LIBRARY_PATH="$PDK_ROOT/$PDK/libs.tech/xschem"
+
+# Handy aliases (do not overwrite system installs)
+alias magic-sky130='magic -rcfile "$MAGICRC"'
+alias xschem-sky130='XSCHEM_LIBRARY_PATH="$XSCHEM_LIBRARY_PATH" xschem'
+
+# Quick checks (helpers)
+magic_check(){ command -v magic >/dev/null && magic -dnull -noconsole -rcfile /dev/null -e 'quit' || echo "magic not found"; }
+ngspice_check(){ command -v ngspice >/dev/null && ngspice -v || echo "ngspice not found"; }
+xschem_check(){ command -v xschem >/dev/null && xschem -v || echo "xschem not found"; }
 EOF
 chmod +x "$ACTIVATE"
+
