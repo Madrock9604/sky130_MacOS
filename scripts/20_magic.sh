@@ -55,13 +55,17 @@ git clean -xfd
   --x-libraries=/opt/X11/lib \
   --enable-cairo
 
-# Build (inherit our flags in all subdirs)
+# --- PRE-BUILD: force-generate the auto header to avoid race conditions ---
+# Some parallel builds start compiling subdirs before database/database.h exists.
+# This ensures the header is present first, then we'll run the full build.
+make -C src database/database.h || ( cd src && ./scripts/makedbh ./database/database.h.in database/database.h )
+
+# Optional: verify it exists (fail early if not)
+[ -f src/database/database.h ] || { echo "[ERR] src/database/database.h not generated"; exit 1; }
+
+# Now do the full (parallel) build
 make -j"$(/usr/sbin/sysctl -n hw.ncpu)"
 make install
-
-
-
-
 
 ln -sf "$EDA_ROOT/opt/magic/bin/magic" "$BIN_DIR/magic"
 
