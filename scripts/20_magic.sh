@@ -25,9 +25,16 @@ cd magic
 
 
 # Configure with Tcl/Tk from Homebrew and XQuartz headers/libs
-export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig${PKG_CONFIG_PATH:+:}$PKG_CONFIG_PATH"
-export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS:-}"
+# (Works with: set -euo pipefail)
+if [ -n "${PKG_CONFIG_PATH-}" ]; then
+  export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig:$PKG_CONFIG_PATH"
+else
+  export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig"
+fi
+
+export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS-}"
+export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS-}"
+
 
 # Ensure a clean tree (important if you retried earlier)
 git reset --hard
