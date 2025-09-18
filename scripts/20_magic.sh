@@ -63,13 +63,12 @@ echo "[INFO] Configuring magic…"
   --enable-cairo
 
 # ===== Pre-generate auto header to avoid parallel build race =====
-# Some parallel builds start compiling before src/database/database.h exists.
-if [ ! -f "src/database/database.h" ]; then
-  echo "[INFO] Pre-generating src/database/database.h …"
-  # Call generator with explicit paths (no cd into src)
-  sh "src/scripts/makedbh" "src/database/database.h.in" "src/database/database.h"
+# Magic expects scripts/makedbh and database/* at the REPO ROOT (not src/).
+if [ ! -f "database/database.h" ]; then
+  echo "[INFO] Pre-generating database/database.h …"
+  ./scripts/makedbh "database/database.h.in" "database/database.h"
 fi
-[ -f "src/database/database.h" ] || { echo "[ERR] Failed to generate src/database/database.h"; exit 1; }
+[ -f "database/database.h" ] || { echo "[ERR] Failed to generate database/database.h"; exit 1; }
 
 # ===== Build & install =====
 echo "[INFO] Building magic…"
