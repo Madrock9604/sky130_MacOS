@@ -36,7 +36,10 @@ fi
 CPPBASE="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include"
 # *** Key fix: add src-relative includes for subdir builds (commands/, cmwind/, etc.) ***
 CPPREL="-I. -I.. -I../.."
+
+# Apply to BOTH CPPFLAGS and CFLAGS (some sub-makefiles ignore CPPFLAGS)
 export CPPFLAGS="$CPPBASE $CPPREL ${CPPFLAGS-}"
+export CFLAGS="$CPPBASE $CPPREL ${CFLAGS-}"
 
 export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS-}"
 
@@ -52,9 +55,10 @@ git clean -xfd
   --x-libraries=/opt/X11/lib \
   --enable-cairo
 
-# Build (honors our exported CPPFLAGS)
+# Build (inherit our flags in all subdirs)
 make -j"$(/usr/sbin/sysctl -n hw.ncpu)"
 make install
+
 
 
 
