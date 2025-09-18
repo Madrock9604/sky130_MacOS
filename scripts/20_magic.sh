@@ -29,18 +29,24 @@ export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig${PKG_CONFIG_PATH:+
 export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS:-}"
 export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS:-}"
 
+# Ensure a clean tree (important if you retried earlier)
+git reset --hard
+git clean -xfd
 
 ./configure \
---prefix="$EDA_ROOT/opt/magic" \
---with-tcl="$BREW_PREFIX/opt/tcl-tk/lib" \
---with-tk="$BREW_PREFIX/opt/tcl-tk/lib" \
---x-includes=/opt/X11/include \
---x-libraries=/opt/X11/lib \
---enable-cairo
+  --prefix="$EDA_ROOT/opt/magic" \
+  --with-tcl="$BREW_PREFIX/opt/tcl-tk/lib" \
+  --with-tk="$BREW_PREFIX/opt/tcl-tk/lib" \
+  --x-includes=/opt/X11/include \
+  --x-libraries=/opt/X11/lib \
+  --enable-cairo
 
+# *** Key fix: guarantee src-relative includes during subdir builds ***
+export CFLAGS="${CFLAGS:-} -I.. -I../.."
 
-make -j"$(/usr/sbin/sysctl -n hw.ncpu)"
+make -j"$(( $(/usr/sbin/sysctl -n hw.ncpu) ))"
 make install
+
 
 
 ln -sf "$EDA_ROOT/opt/magic/bin/magic" "$BIN_DIR/magic"
