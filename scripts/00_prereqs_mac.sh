@@ -81,3 +81,5 @@ export PDK="${PDK:-sky130A}"
 
 # Prefer Brew's tcl-tk and XQuartz headers/libs for builds
 ok "Prereqs done. You can now run component installers."
+EOF
+chmod +x "$ACTIVATE"
