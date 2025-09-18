@@ -25,18 +25,22 @@ cd magic
 
 
 # Configure with Tcl/Tk from Homebrew and XQuartz headers/libs
-# (Works with: set -euo pipefail)
+# (safe under: set -euo pipefail)
 if [ -n "${PKG_CONFIG_PATH-}" ]; then
   export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig:$PKG_CONFIG_PATH"
 else
   export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig"
 fi
 
-export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS-}"
+# Base includes (Brew Tcl/Tk + XQuartz)
+CPPBASE="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include"
+# *** Key fix: add src-relative includes for subdir builds (commands/, cmwind/, etc.) ***
+CPPREL="-I. -I.. -I../.."
+export CPPFLAGS="$CPPBASE $CPPREL ${CPPFLAGS-}"
+
 export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS-}"
 
-
-# Ensure a clean tree (important if you retried earlier)
+# Ensure a clean tree in case of previous failed builds
 git reset --hard
 git clean -xfd
 
@@ -48,11 +52,10 @@ git clean -xfd
   --x-libraries=/opt/X11/lib \
   --enable-cairo
 
-# *** Key fix: guarantee src-relative includes during subdir builds ***
-export CFLAGS="${CFLAGS:-} -I.. -I../.."
-
-make -j"$(( $(/usr/sbin/sysctl -n hw.ncpu) ))"
+# Build (honors our exported CPPFLAGS)
+make -j"$(/usr/sbin/sysctl -n hw.ncpu)"
 make install
+
 
 
 
