@@ -24,10 +24,16 @@ fi
 cd xschem
 
 
-# Prefer Brew Tcl/Tk and XQuartz
-export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig${PKG_CONFIG_PATH:+:}$PKG_CONFIG_PATH"
-export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS:-}"
+# Configure with Tcl/Tk from Homebrew and XQuartz headers/libs
+# (Works with: set -euo pipefail)
+if [ -n "${PKG_CONFIG_PATH-}" ]; then
+  export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig:$PKG_CONFIG_PATH"
+else
+  export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig"
+fi
+
+export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS-}"
+export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS-}"
 
 
 # xschem provides a standard autotools configure
