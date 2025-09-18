@@ -10,6 +10,7 @@ BIN_DIR="$EDA_ROOT/bin"
 MAGIC_REF="${MAGIC_REF:-master}"   # set to a tag/commit for reproducible builds
 
 # ===== Prep =====
+# Bring Homebrew into PATH for this non-interactive shell
 if command -v brew >/dev/null 2>&1; then
   eval "$($(command -v brew) shellenv)"
 else
@@ -30,14 +31,19 @@ MAGIC_DIR="$SRC_DIR/magic"
 cd "$MAGIC_DIR"
 
 # ===== Build flags (nounset-safe) =====
+# PKG_CONFIG_PATH (prepend brew tcl-tk)
 if [ -n "${PKG_CONFIG_PATH-}" ]; then
   export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig:$PKG_CONFIG_PATH"
 else
   export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig"
 fi
 
+# Base includes for Brew Tcl/Tk + XQuartz
 CPPBASE="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include"
+# Key: src-relative includes so subdir builds (commands/, cmwind/, etc.) find ../database
 CPPREL="-I. -I.. -I../.."
+
+# Apply to BOTH CPPFLAGS and CFLAGS (some sub-makefiles ignore CPPFLAGS)
 export CPPFLAGS="$CPPBASE $CPPREL ${CPPFLAGS-}"
 export CFLAGS="$CPPBASE $CPPREL ${CFLAGS-}"
 export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS-}"
@@ -56,11 +62,24 @@ echo "[INFO] Configuring magic…"
   --x-libraries=/opt/X11/lib \
   --enable-cairo
 
-# ===== Pre-generate database/database.h to avoid parallel race =====
+# ===== Pre-generate database/database.h to avoid parallel build race =====
 if [ ! -f "database/database.h" ]; then
   echo "[INFO] Pre-generating database/database.h …"
-  # Prefer the Makefile rule (same as the project uses), fall back to the script.
-  make database/database.h || ./scripts/makedbh "database/database.h.in" "database/database.h"
+  # 1) Try the project's Makefile rule
+  if ! make database/database.h; then
+    # 2) Fallback: run the generator script from repo root
+    if [ ! -x "./scripts/makedbh" ]; then
+      chmod +x ./scripts/makedbh || true
+    fi
+    if ! ./scripts/makedbh "database/database.h.in" "database/database.h"; then
+      # 3) Last resort: call with csh explicitly (shebang compatibility)
+      if command -v /bin/csh >/dev/null 2>&1; then
+        /bin/csh ./scripts/makedbh "database/database.h.in" "database/database.h"
+      else
+        echo "[ERR] Could not run scripts/makedbh (csh not found)"; exit 1
+      fi
+    fi
+  fi
 fi
 [ -f "database/database.h" ] || { echo "[ERR] Failed to generate database/database.h"; exit 1; }
 
@@ -75,7 +94,7 @@ make install
 mkdir -p "$BIN_DIR"
 ln -sf "$EDA_ROOT/opt/magic/bin/magic" "$BIN_DIR/magic"
 
-# ===== Headless sanity check =====
+# ===== Headless sanity check (don’t fail hard if GUI-only env) =====
 if "$EDA_ROOT/opt/magic/bin/magic" -dnull -noconsole -rcfile /dev/null -e 'quit' >/dev/null 2>&1; then
   echo "[OK ] Magic headless check passed"
 else
