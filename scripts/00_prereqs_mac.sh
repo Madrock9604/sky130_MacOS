@@ -81,9 +81,17 @@ export PDK="${PDK:-sky130A}"
 # Prefer Brew's Tcl/Tk and XQuartz headers/libs for builds
 BREW_PREFIX=$(brew --prefix 2>/dev/null || echo "/opt/homebrew")
 export PATH="$EDA_ROOT/bin:$PATH"
-export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig${PKG_CONFIG_PATH:+:}$PKG_CONFIG_PATH"
-export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS:-}"
+# Configure with Tcl/Tk from Homebrew and XQuartz headers/libs
+# (Works with: set -euo pipefail)
+if [ -n "${PKG_CONFIG_PATH-}" ]; then
+  export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig:$PKG_CONFIG_PATH"
+else
+  export PKG_CONFIG_PATH="$BREW_PREFIX/opt/tcl-tk/lib/pkgconfig"
+fi
+
+export CPPFLAGS="-I$BREW_PREFIX/opt/tcl-tk/include -I/opt/X11/include ${CPPFLAGS-}"
+export LDFLAGS="-L$BREW_PREFIX/opt/tcl-tk/lib -L/opt/X11/lib ${LDFLAGS-}"
+
 
 # X11 display; XQuartz usually sets this automatically
 export DISPLAY="${DISPLAY:-:0}"
