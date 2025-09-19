@@ -61,6 +61,7 @@ echo "[INFO] Configuring magic…"
   --x-includes=/opt/X11/include \
   --x-libraries=/opt/X11/lib \
   --enable-cairo
+  --disable-opengl
 
 # ===== Pre-generate database/database.h to avoid parallel build race =====
 if [ ! -f "database/database.h" ]; then
