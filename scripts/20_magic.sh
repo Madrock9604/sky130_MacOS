@@ -54,14 +54,7 @@ git clean -xfd
 
 # ===== Configure =====
 echo "[INFO] Configuring magic…"
-./configure \
-  --prefix="$EDA_ROOT/opt/magic" \
-  --with-tcl="$BREW_PREFIX/opt/tcl-tk/lib" \
-  --with-tk="$BREW_PREFIX/opt/tcl-tk/lib" \
-  --x-includes=/opt/X11/include \
-  --x-libraries=/opt/X11/lib \
-  --enable-cairo \
-  --disable-opengl
+./configure --prefix="$EDA_ROOT/opt/magic" --with-tcl="$BREW_PREFIX/opt/tcl-tk/lib" --with-tk="$BREW_PREFIX/opt/tcl-tk/lib" --x-includes=/opt/X11/include --x-libraries=/opt/X11/lib --enable-cairo --disable-opengl
 
 # ===== Pre-generate database/database.h to avoid parallel build race =====
 if [ ! -f "database/database.h" ]; then
