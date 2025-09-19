@@ -60,7 +60,7 @@ echo "[INFO] Configuring magic…"
   --with-tk="$BREW_PREFIX/opt/tcl-tk/lib" \
   --x-includes=/opt/X11/include \
   --x-libraries=/opt/X11/lib \
-  --enable-cairo
+  --enable-cairo \
   --disable-opengl
 
 # ===== Pre-generate database/database.h to avoid parallel build race =====
