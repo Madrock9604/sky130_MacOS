@@ -1,187 +1,110 @@
 #!/usr/bin/env bash
-# -----------------------------------------------------------------------------
-# scripts/20_magic.sh
-# -----------------------------------------------------------------------------
-# Purpose:
-#   Install MAGIC VLSI from source on macOS into ~/.eda/sky130_dev,
-#   pinned to Tcl/Tk 8.6 (Aqua). No manual steps required.
-#
-# What this script does:
-#   - Ensures Homebrew is installed and available in THIS shell.
-#   - Ensures/installs build tools (git, cairo, pkg-config, gawk, make, wget).
-#   - Ensures/installs Tcl/Tk 8.6 (Homebrew’s "tcl-tk@8") and verifies it.
-#   - Downloads/builds/installs Magic with Cairo enabled and OpenGL disabled.
-#   - Adds WISH=…/wish8.6 to ~/.eda/sky130_dev/activate for easy GUI launching.
-#   - (Optional) Launches Magic GUI immediately with --gui or RUN_GUI=1.
-#
-# Usage:
-#   bash scripts/20_magic.sh           # build/install only
-#   bash scripts/20_magic.sh --gui     # build/install, then open GUI
-#   RUN_GUI=1 bash scripts/20_magic.sh # same as --gui
-#
-# Logs:
-#   ~/sky130-diag/magic_install.log
-#
-# After install (open GUI any time):
-#   magic -d null -T scmos -rcfile /dev/null -wrapper
-# -----------------------------------------------------------------------------
-
+# Build & install Magic (Tk 8.6 / Aqua + Cairo; NO OpenGL) into ~/.eda/sky130_dev
 set -euo pipefail
 
-# ---------------- Configuration (change only if you know why) ----------------
-ARCH="$(uname -m)"
-DEFAULT_BREW_PREFIX="/opt/homebrew"; [ "$ARCH" != "arm64" ] && DEFAULT_BREW_PREFIX="/usr/local"
-
-PREFIX="${PREFIX:-$HOME/.eda/sky130_dev}"     # Install location
-SRC_DIR="${SRC_DIR:-$HOME/src-eda}"           # Where sources are cloned/built
-X11_PREFIX="${X11_PREFIX:-/opt/X11}"          # Headers path; GUI uses Aqua (not X11)
-LOG_DIR="${LOG_DIR:-$HOME/sky130-diag}"
-JOBS="${JOBS:-$(sysctl -n hw.ncpu)}"
+# --- locations
+EDA_PREFIX="${EDA_PREFIX:-$HOME/.eda/sky130_dev}"
+PREFIX_BIN="$EDA_PREFIX/bin"
+PREFIX_LIB="$EDA_PREFIX/lib"
+LOGDIR="${LOGDIR:-$HOME/sky130-diag}"
+LOG="$LOGDIR/magic_install.log"
+SRC_DIR="$HOME/.eda/src"
 MAGIC_REPO="${MAGIC_REPO:-https://github.com/RTimothyEdwards/magic.git}"
-MAGIC_TAG="${MAGIC_TAG:-master}"              # For reproducibility you may pin a tag
-RUN_GUI="${RUN_GUI:-0}"                        # Set to "1" or pass --gui to open the GUI after build
 
-mkdir -p "$SRC_DIR" "$LOG_DIR" "$PREFIX"
-LOG="$LOG_DIR/magic_install.log"
+mkdir -p "$LOGDIR" "$PREFIX_BIN" "$SRC_DIR"
 exec > >(tee -a "$LOG") 2>&1
 
-# ---------------- Helpers ----------------
-say()   { printf "[INFO] %s\n" "$*"; }
-ok()    { printf "✅ %s\n" "$*"; }
-die()   { printf "❌ %s\n" "$*\n" >&2; exit 1; }
-trap 'die "Magic install failed at line $LINENO. See log: $LOG"' ERR
+die(){ echo "❌ $*" >&2; exit 1; }
+ok(){ echo "✅ $*"; }
 
-# Accept --gui flag
-if [[ "${1:-}" == "--gui" ]]; then RUN_GUI=1; fi
+echo "Magic installer (Tk 8.6 / Aqua, Cairo, no OpenGL)"
 
-say "Magic installer (Tk 8.6 / Aqua)"
-
-# ---------------- Ensure Homebrew is present and usable ----------------
-BREW_BIN=""
-for p in "$DEFAULT_BREW_PREFIX/bin/brew" /opt/homebrew/bin/brew /usr/local/bin/brew; do
-  [[ -x "$p" ]] && BREW_BIN="$p" && break
-done
-if [[ -z "$BREW_BIN" ]]; then
-  say "Installing Homebrew… (follow prompts if shown)"
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  for p in "$DEFAULT_BREW_PREFIX/bin/brew" /opt/homebrew/bin/brew /usr/local/bin/brew; do
-    [[ -x "$p" ]] && BREW_BIN="$p" && break
-  done
-  [[ -n "$BREW_BIN" ]] || die "Homebrew installed but not found on expected paths."
+# 0) Load brew into THIS shell and basic deps
+if ! command -v brew >/dev/null 2>&1; then
+  # if prereqs added shellenv to zprofile/zshrc, source it
+  if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; fi
+  if [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
 fi
-# Load brew environment into THIS shell
-eval "$("$BREW_BIN" shellenv)"
-ok "Homebrew ready: $BREW_BIN"
+command -v brew >/dev/null || die "Homebrew not found. Run 00_prereqs_mac.sh first."
+ok "Homebrew ready: $(command -v brew)"
 
-# ---------------- Install required packages ----------------
-# Build tools (idempotent: skipped if already installed)
-NEEDED=(git cairo pkg-config gawk make wget)
-for pkg in "${NEEDED[@]}"; do
-  if ! brew list --versions "$pkg" >/dev/null 2>&1; then
-    say "Installing $pkg…"
-    brew install "$pkg"
-  fi
-done
-ok "Common build dependencies installed"
+# 1) Ensure Cairo present (quiet if already installed)
+brew list --versions cairo >/dev/null 2>&1 || brew install cairo
 
-# ---------------- Ensure Tcl/Tk 8.6 exists and find its prefix ----------------
-brew update >/dev/null
-
-# Install Homebrew’s Tk 8.x keg (this is 8.6); harmless if already installed
-brew list --versions tcl-tk@8 >/dev/null 2>&1 || brew install tcl-tk@8 || true
-
-# ---- Ensure/resolve Tcl/Tk 8.6 (install if missing), verify via wish8.6 ----
+# 2) Locate Tk 8.6 from prereqs and verify wish8.6
 TK86_PREFIX="$(brew --prefix tcl-tk@8 2>/dev/null || true)"
-if [ -z "$TK86_PREFIX" ] || [ ! -x "$TK86_PREFIX/bin/wish8.6" ]; then
-  echo "[INFO] Installing (or re-installing) tcl-tk@8…"
-  brew install tcl-tk@8 || brew reinstall tcl-tk@8 || true
-  TK86_PREFIX="$(brew --prefix tcl-tk@8 2>/dev/null || true)"
+[ -n "$TK86_PREFIX" ] && [ -x "$TK86_PREFIX/bin/wish8.6" ] || die "Tcl/Tk 8.6 not usable. Re-run 00_prereqs_mac.sh"
+TK_VER="$("$TK86_PREFIX/bin/wish8.6" <<< 'puts [info patchlevel]; exit' 2>/dev/null || true)"
+[[ "$TK_VER" == 8.6.* ]] || die "wish8.6 reports $TK_VER (need 8.6.x)."
+
+# 3) Build flags so Magic finds keg-only Tk and Cairo
+export PKG_CONFIG_PATH="$TK86_PREFIX/lib/pkgconfig:$(brew --prefix cairo)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export CPPFLAGS="-I$TK86_PREFIX/include -I$(brew --prefix cairo)/include ${CPPFLAGS:-}"
+export LDFLAGS="-L$TK86_PREFIX/lib -L$(brew --prefix cairo)/lib ${LDFLAGS:-}"
+export WISH="${WISH:-$TK86_PREFIX/bin/wish8.6}"
+
+# 4) Get magic source (shallow clone/update)
+if [ -d "$SRC_DIR/magic/.git" ]; then
+  echo "[INFO] Updating existing magic repo…"
+  git -C "$SRC_DIR/magic" fetch --tags --depth 1 origin || true
+  git -C "$SRC_DIR/magic" reset --hard origin/master
+else
+  echo "[INFO] Cloning magic…"
+  git clone --depth 1 "$MAGIC_REPO" "$SRC_DIR/magic"
 fi
+cd "$SRC_DIR/magic"
 
-# Verify: ask wish8.6 for its version
-if [ -x "$TK86_PREFIX/bin/wish8.6" ]; then
-  TK_VER="$("$TK86_PREFIX/bin/wish8.6" <<< 'puts [info patchlevel]; exit' 2>/dev/null || true)"
-fi
-[ -n "${TK_VER:-}" ] && [[ "$TK_VER" == 8.6.* ]] || die "Tcl/Tk 8.6 not usable. (wish8.6 missing or wrong version). See $LOG"
+# 5) Configure: force NO OpenGL; prefer Cairo; NO X11 (we’ll use Aqua via Tk)
+#    The ac_cv_* vars tell autoconf “pretend GL headers/libs do not exist”.
+export ac_cv_header_GL_gl_h=no
+export ac_cv_header_OpenGL_gl_h=no
+export ac_cv_lib_GL_glFlush=no
+export ac_cv_lib_GL_glXCreateContext=no
+export ac_cv_lib_GL_glBegin=no
+export ac_cv_func_glXCreateContext=no
 
-ok "Using Tk $TK_VER at: $TK86_PREFIX"
-
-# Ensure build tools can find this keg (keg-only)
-export PKG_CONFIG_PATH="$TK86_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export CPPFLAGS="-I$TK86_PREFIX/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$TK86_PREFIX/lib ${LDFLAGS:-}"
-
-
-# ---------------- Fetch Magic source ----------------
-cd "$SRC_DIR"
-if [[ ! -d magic ]]; then
-  say "Cloning Magic…"
-  git clone "$MAGIC_REPO" magic
-fi
-cd magic
-git fetch --all --tags
-git checkout "$MAGIC_TAG"
-git pull --ff-only || true
-make distclean >/dev/null 2>&1 || true
-
-# ---------------- Configure Magic (Aqua/Tk 8.6, Cairo ON, OpenGL OFF) ----------------
-# We include X11 headers in case some optional bits look for them; GUI uses Aqua via Tk.
-export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
-export CPPFLAGS="-I$(brew --prefix)/include -I$X11_PREFIX/include -I$TK86_PREFIX/include"
-export LDFLAGS="-L$(brew --prefix)/lib -L$X11_PREFIX/lib -L$TK86_PREFIX/lib"
-
-say "Configuring Magic…"
+echo "[INFO] ./configure …"
 ./configure \
-  --prefix="$PREFIX" \
-  --with-tcl="$TK86_PREFIX/lib" \
-  --with-tk="$TK86_PREFIX/lib" \
-  --with-x="$X11_PREFIX" \
-  --enable-cairo \
-  --disable-opengl
-ok "Configure OK"
+  --prefix="$EDA_PREFIX" \
+  --with-tcl="$TK86_PREFIX/lib" --with-tk="$TK86_PREFIX/lib" \
+  --with-tclincl="$TK86_PREFIX/include" --with-tkinc="$TK86_PREFIX/include" \
+  --with-opengl=no --with-cairo=yes --with-x=no || die "configure failed."
 
-# ---------------- Build and install ----------------
-say "Building (header-safe stage)…"
-make -j1
-say "Building (parallel)…"
-make -j"$JOBS"
-say "Installing to $PREFIX…"
-make install
-
-BIN="$PREFIX/bin/magic"
-[[ -x "$BIN" ]] || die "Magic binary missing after install."
-ok "Magic installed: $BIN"
-
-# ---------------- Post-install: teach your environment about wish8.6 ----------------
-ACTIVATE="$PREFIX/activate"
-mkdir -p "$PREFIX"
-if ! grep -q 'wish8\.6' "$ACTIVATE" 2>/dev/null; then
-  {
-    echo '# Prefer Tk 8.6 for Magic Aqua GUI'
-    echo "export WISH=\"$TK86_PREFIX/bin/wish8.6\""
-  } >> "$ACTIVATE"
-  say "Added WISH hint to $ACTIVATE"
+# 6) Safety belt: if any W3D*/TOGL* objects crept into Makefiles, strip them.
+if grep -R -E 'W3D|TOGL' graphics Makefile* >/dev/null 2>&1; then
+  echo "[INFO] Patching Makefiles to remove 3D/OpenGL objects…"
+  sed -E -i '' 's/[[:space:]]W3D[^[:space:]]*\.o//g' graphics/Makefile || true
+  sed -E -i '' 's/[[:space:]]grTOGL[^[:space:]]*\.o//g' graphics/Makefile || true
+  sed -E -i '' 's/[[:space:]]TOGL[^[:space:]]*\.o//g' graphics/Makefile || true
 fi
 
-# ---------------- Sanity check (headless; confirms Tcl/Tk 8.6 is used) ----------------
-say "Headless sanity check (Tcl/Tk + Magic versions)…"
-"$BIN" -d null -noconsole -rcfile /dev/null -T scmos <<'EOF'
-puts "Tcl: [info patchlevel]  Tk: [tk patchlevel]"
+# 7) Build & install
+echo "[INFO] Building…"
+make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" || die "make failed."
+echo "[INFO] Installing…"
+make install || die "make install failed."
+
+# 8) Wrapper to ensure this Magic takes precedence
+mkdir -p "$PREFIX_BIN"
+cat > "$PREFIX_BIN/magic" <<'EOF'
+#!/usr/bin/env bash
+# Magic wrapper (repo build, Tk 8.6/Aqua + Cairo, no OpenGL)
+PREFIX="$HOME/.eda/sky130_dev"
+exec "$PREFIX/bin/magic" "$@"
+EOF
+chmod +x "$PREFIX_BIN/magic"
+
+# 9) Headless smoke test (no -eval). Prints versions and exits.
+SMOKE="$LOGDIR/magic-smoke.tcl"
+cat > "$SMOKE" <<'EOF'
+puts "Tcl: [info patchlevel]"
+if {[catch {package require Tk}]} { puts "Tk: (not loaded)"; } else { puts "Tk: [tk patchlevel]" }
 puts "Magic: [magic::version]"
-quit
+quit -noprompt
 EOF
 
-# ---------------- Optional: open the GUI right now ----------------
-if [[ "$RUN_GUI" == "1" ]]; then
-  say "Launching Magic GUI (Aqua)…"
-  # Clean any previous wish/magic processes just in case
-  pkill -if '(wish8\.6|magic)' 2>/dev/null || true
-  # Run Magic under wish8.6 and auto-open a layout window (no XQuartz needed)
-  exec env TCLLIBPATH="$TK86_PREFIX/lib" \
-    "$TK86_PREFIX/bin/wish8.6" "$PREFIX/lib/magic/tcl/magic.tcl" \
-    -d null -T scmos -rcfile /dev/null -wrapper
-fi
+echo "[INFO] Smoke test…"
+"$PREFIX_BIN/magic" -d null -noconsole -rcfile /dev/null -T scmos "$SMOKE" || die "Smoke test failed."
 
-ok "Magic build complete. To open GUI later:"
-echo "  magic -d null -T scmos -rcfile /dev/null -wrapper"
-echo "Log: $LOG"
+ok "Magic built and installed at $PREFIX_BIN/magic"
+echo "Try GUI (Aqua/Cairo):  magic -d XR -T scmos -rcfile /dev/null -wrapper"
