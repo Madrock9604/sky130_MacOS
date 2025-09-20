@@ -1,138 +1,180 @@
 #!/usr/bin/env bash
-# Install Magic VLSI from the official release tarball (no external build repos)
-# Usage (GUI):     curl -fsSL <raw-url> | env PREFIX="$HOME/eda" MAGIC_VER="8.3.552" bash -s --
-# Usage (headless):curl -fsSL <raw-url> | env PREFIX="$HOME/eda" MAGIC_VER="8.3.552" HEADLESS=1 bash -s --
+# Magic (8.3) builder for macOS (Apple Silicon & Intel)
+# - Installs under ~/.eda (default) and updates ~/.eda/sky130/activate
+# - Uses MacPorts (/opt/local) if present, else Homebrew (/opt/homebrew)
+# - Builds with Tk/X11 GUI when XQuartz is present
+# - No external repos besides the official Magic git
 
-set -Eeuo pipefail
+set -euo pipefail
 
-# ---------- Config ----------
-PREFIX="${PREFIX:-"$HOME/eda"}"          # install prefix
-MAGIC_VER="${MAGIC_VER:-8.3.552}"        # Magic release tag
-SRC_URL="https://github.com/RTimothyEdwards/magic/archive/refs/tags/${MAGIC_VER}.tar.gz"
+# -------------------------
+# Configurable environment
+# -------------------------
+: "${EDA_HOME:=$HOME/.eda}"                # base EDA dir (env lives here)
+: "${PREFIX:=$EDA_HOME}"                   # install prefix (bin -> ~/.eda/bin)
+: "${ACTIVATE_FILE:=$EDA_HOME/sky130/activate}"
+: "${MAGIC_VER:=8.3.552}"                  # tag or branch in Magic repo
+: "${MAGIC_REPO:=https://github.com/RTimothyEdwards/magic.git}"
+: "${ENABLE_OPENGL:=no}"                   # yes/no (macOS+XQuartz is fickle)
+: "${ENABLE_CAIRO:=no}"                    # yes/no
 
-# Optional env toggles:
-#   USE_HOMEBREW=1  -> prefer Homebrew paths
-#   USE_MACPORTS=1  -> prefer MacPorts paths
-#   HEADLESS=1      -> force no-X11 build
+# -------------------------
+# Detect toolchains/paths
+# -------------------------
+if ! command -v git >/dev/null 2>&1; then
+  echo "[ERR ] 'git' not found. Install Xcode CLT:  xcode-select --install" >&2
+  exit 1
+fi
 
-# ---------- Helpers ----------
-info(){ printf '[INFO] %s\n' "$*"; }
-warn(){ printf '[WARN] %s\n' "$*" >&2; }
-err(){ printf '[ERR ] %s\n' "$*" >&2; exit 1; }
+if command -v port >/dev/null 2>&1 && [ -d /opt/local ]; then
+  PKG_SYS="macports"
+  TCL_PREFIX="/opt/local"
+  TCL_BIN="$TCL_PREFIX/bin"
+  : "${TCLSH:=$TCL_BIN/tclsh8.6}"
+elif command -v brew >/dev/null 2>&1; then
+  PKG_SYS="homebrew"
+  if brew --prefix tcl-tk >/dev/null 2>&1; then
+    TCL_PREFIX="$(brew --prefix tcl-tk)"
+  else
+    # common default on Apple Silicon
+    TCL_PREFIX="/opt/homebrew/opt/tcl-tk"
+  fi
+  TCL_BIN="$TCL_PREFIX/bin"
+  if [ -x "$TCL_BIN/tclsh8.6" ]; then
+    : "${TCLSH:=$TCL_BIN/tclsh8.6}"
+  else
+    : "${TCLSH:=$TCL_BIN/tclsh}"
+  fi
+else
+  echo "[ERR ] Neither MacPorts nor Homebrew found. Install one of them." >&2
+  exit 1
+fi
 
+# XQuartz (X11) — optional but required for GUI
+if [ -d /opt/X11 ]; then
+  X11_PREFIX="/opt/X11"
+  HAVE_X11=1
+else
+  X11_PREFIX=""
+  HAVE_X11=0
+fi
+
+echo "[INFO] Using install PREFIX: $PREFIX"
+echo "[INFO] Package system: $PKG_SYS"
+echo "[INFO] TCL/TK prefix: $TCL_PREFIX"
+echo "[INFO] Detected TCLSH: ${TCLSH:-"(none)"}"
+if [ "$HAVE_X11" -eq 1 ]; then
+  echo "[INFO] X11 detected at $X11_PREFIX (XQuartz). Magic will build with GUI."
+else
+  echo "[WARN] X11 (XQuartz) not found. Magic will build, but only '-dnull' (no GUI) will work."
+fi
+
+if [ ! -x "${TCLSH:-/nonexistent}" ]; then
+  echo "[ERR ] tclsh not found/executable at $TCLSH" >&2
+  echo "       Install Tcl/Tk 8.6 (MacPorts: 'sudo port install tcl tk' | Homebrew: 'brew install tcl-tk')." >&2
+  exit 1
+fi
+
+# -------------------------
+# Prepare dirs
+# -------------------------
+mkdir -p "$PREFIX"/{bin,lib,include,src} "$EDA_HOME/sky130"
 BUILD_ROOT="$(mktemp -d -t magic-remote-build-XXXXXX)"
-TARBALL="${BUILD_ROOT}/magic-${MAGIC_VER}.tar.gz"
-cleanup(){ [[ -d "$BUILD_ROOT" ]] && rm -rf "$BUILD_ROOT" || true; }
+SRC_DIR="$BUILD_ROOT/magic-src"
+
+cleanup() { [ -d "$BUILD_ROOT" ] && rm -rf "$BUILD_ROOT"; }
 trap cleanup EXIT
 
-# ---------- Toolchain / paths ----------
-HAVE_BREW=0; HAVE_PORT=0
-command -v brew >/dev/null 2>&1 && HAVE_BREW=1
-command -v port >/dev/null 2>&1 && HAVE_PORT=1
-if [[ "${USE_HOMEBREW:-0}" == "1" ]]; then [[ $HAVE_BREW -eq 1 ]] || err "Homebrew requested but not found"; HAVE_PORT=0; fi
-if [[ "${USE_MACPORTS:-0}" == "1" ]]; then [[ $HAVE_PORT -eq 1 ]] || err "MacPorts requested but not found"; HAVE_BREW=0; fi
+# -------------------------
+# Fetch + configure
+# -------------------------
+echo "[INFO] Cloning Magic $MAGIC_VER…"
+git clone --depth 1 --branch "$MAGIC_VER" "$MAGIC_REPO" "$SRC_DIR" >/dev/null
 
-TCLTK_PREFIX=""; X11_PREFIX=""; TCLSH_BIN=""
-
-if [[ $HAVE_PORT -eq 1 ]]; then
-  TCLTK_PREFIX="/opt/local"
-  TCLSH_BIN="/opt/local/bin/tclsh8.6"
-  X11_PREFIX="/opt/X11"
-elif [[ $HAVE_BREW -eq 1 ]]; then
-  BREW_PREFIX="$(brew --prefix)"
-  if brew list --versions tcl-tk >/dev/null 2>&1; then
-    TCLTK_PREFIX="$(brew --prefix tcl-tk)"
-    # pick a tclsh
-    for c in tclsh8.6 tclsh9.0 tclsh; do command -v "$c" >/dev/null 2>&1 && TCLSH_BIN="$(command -v "$c")" && break; done
-  else
-    TCLTK_PREFIX="$BREW_PREFIX"
-    for c in tclsh8.6 tclsh; do command -v "$c" >/dev/null 2>&1 && TCLSH_BIN="$(command -v "$c")" && break; done
-  fi
-  X1="/opt/X11"; [[ -d "$X1" ]] && X11_PREFIX="$X1" || X11_PREFIX=""
-else
-  # fallback heuristics
-  for p in /opt/local /opt/homebrew /usr/local; do [[ -d "$p" ]] && TCLTK_PREFIX="$p"; done
-  TCLSH_BIN="$(command -v tclsh8.6 || true)"; [[ -n "${TCLSH_BIN:-}" ]] || TCLSH_BIN="$(command -v tclsh || true)"
-  [[ -d /opt/X11 ]] && X11_PREFIX="/opt/X11" || X11_PREFIX=""
-fi
-
-[[ -d "$PREFIX" ]] || mkdir -p "$PREFIX"
-
-info "Using install PREFIX: ${PREFIX}"
-info "Detected TCLSH: ${TCLSH_BIN:-"(not found)"}"
-info "TCL/TK prefix: ${TCLTK_PREFIX:-"(unknown)"}"
-if [[ "${HEADLESS:-0}" == "1" ]]; then
-  info "HEADLESS=1 -> building without X11 GUI"
-elif [[ -n "$X11_PREFIX" && -d "$X11_PREFIX" ]]; then
-  info "X11 detected at ${X11_PREFIX} (XQuartz). Magic will build with GUI."
-else
-  warn "X11 not found; will fall back to headless. Install XQuartz to enable GUI: https://www.xquartz.org/"
-  export HEADLESS=1
-fi
-
-# ---------- Fetch & unpack ----------
-info "Downloading source archive: ${SRC_URL}"
-curl -fL "$SRC_URL" -o "$TARBALL"
-info "Unpacking…"
-tar -xzf "$TARBALL" -C "$BUILD_ROOT"
-SRC_DIR="$(find "$BUILD_ROOT" -maxdepth 1 -type d -name "magic-*${MAGIC_VER}*" | head -n 1)"
-[[ -d "$SRC_DIR" ]] || err "Failed to find unpacked source directory"
-info "Source directory: ${SRC_DIR}"
 cd "$SRC_DIR"
 
-# ---------- Configure ----------
-CFG_FLAGS=( "--prefix=${PREFIX}" )
-[[ -n "${TCLTK_PREFIX:-}" && -d "${TCLTK_PREFIX}" ]] && CFG_FLAGS+=( "--with-tcl=${TCLTK_PREFIX}" "--with-tk=${TCLTK_PREFIX}" )
+CFG=(
+  "--prefix=$PREFIX"
+  "--with-tcl=$TCL_PREFIX/lib"
+  "--with-tk=$TCL_PREFIX/lib"
+  "--with-tclinclude=$TCL_PREFIX/include"
+)
 
-if [[ "${HEADLESS:-0}" == "1" ]]; then
-  CFG_FLAGS+=( "--with-x=no" )
+if [ "$HAVE_X11" -eq 1 ]; then
+  CFG+=("--x-includes=$X11_PREFIX/include" "--x-libraries=$X11_PREFIX/lib")
 else
-  # Help configure find X headers/libs from XQuartz
-  if [[ -n "${X11_PREFIX:-}" && -d "${X11_PREFIX}" ]]; then
-    CFG_FLAGS+=( "--x-includes=${X11_PREFIX}/include" "--x-libraries=${X11_PREFIX}/lib" )
-  fi
+  CFG+=("--with-x=no")
 fi
 
-# On Homebrew, be explicit so headers/libs are found
-if [[ $HAVE_BREW -eq 1 && -n "${TCLTK_PREFIX:-}" ]]; then
-  export CPPFLAGS="${CPPFLAGS:-} -I${TCLTK_PREFIX}/include"
-  export LDFLAGS="${LDFLAGS:-} -L${TCLTK_PREFIX}/lib"
+if [ "$ENABLE_OPENGL" = "yes" ]; then CFG+=("--with-opengl"); else CFG+=("--with-opengl=no"); fi
+if [ "$ENABLE_CAIRO"  = "yes" ]; then CFG+=("--with-cairo");  else CFG+=("--with-cairo=no");  fi
+
+export CC="${CC:-clang}"
+export CFLAGS="${CFLAGS:-} -Wno-deprecated-non-prototype"
+
+echo "[INFO] Running ./configure ${CFG[*]} …"
+./configure "${CFG[@]}"
+
+echo
+echo "-----------------------------------------------------------"
+echo "Configuration Summary (key bits):"
+grep -E '^(X11|Python3|OpenGL|Cairo|Tcl/Tk):' config.log || true
+echo "-----------------------------------------------------------"
+echo
+
+# -------------------------
+# Build + install
+# -------------------------
+CORES=4
+if command -v sysctl >/dev/null 2>&1; then
+  CORES="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 fi
 
-info "Running ./configure ${CFG_FLAGS[*]}"
-./configure "${CFG_FLAGS[@]}"
+echo "[INFO] Building (make -j$CORES)…"
+make -j"$CORES"
 
-# ---------- Build & Install ----------
-JOBS="$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-info "Building (make -j${JOBS})…"
-make -j"${JOBS}"
-
-info "Installing…"
+echo "[INFO] Installing (make install)…"
 make install
 
-# ---------- Summary ----------
-BIN_DIR="${PREFIX}/bin"
-LIB_DIR="${PREFIX}/lib"
-TCL_DIR="${PREFIX}/lib/magic/tcl"
+# -------------------------
+# Update environment file
+# -------------------------
+touch "$ACTIVATE_FILE"
 
-cat <<EON
+append_once() {
+  local line="$1"
+  local file="$2"
+  # add only if the exact line isn't present
+  if ! grep -qxF "$line" "$file" 2>/dev/null; then
+    echo "$line" >> "$file"
+  fi
+}
 
-========================================================
-Magic ${MAGIC_VER} installed.
+append_once '# magic (auto-added)' "$ACTIVATE_FILE"
+append_once "export EDA_HOME=\"$EDA_HOME\"" "$ACTIVATE_FILE"
+append_once "export PATH=\"$PREFIX/bin:\$PATH\"" "$ACTIVATE_FILE"
+append_once "export MAGIC_HOME=\"$PREFIX\"" "$ACTIVATE_FILE"
 
-  Binaries:    ${BIN_DIR}
-  Libraries:   ${LIB_DIR}
-  Tcl scripts: ${TCL_DIR}
+# Helpful hints for XQuartz users
+if [ "$HAVE_X11" -eq 1 ]; then
+  append_once 'export DISPLAY=${DISPLAY:-:0}' "$ACTIVATE_FILE"
+fi
 
-Add to PATH:
-  echo 'export PATH="${BIN_DIR}:\$PATH"' >> ~/.zshrc && source ~/.zshrc
+echo
+echo "[OK  ] Magic installed to: $PREFIX"
+echo "[OK  ] Environment updated: $ACTIVATE_FILE"
+cat <<'EOF'
 
-Run:
-  magic        # (if GUI built)
-  # or: magic -dnull -noconsole   # headless batch
+To use the environment in your current shell:
+  source ~/.eda/sky130/activate
 
-Notes:
-  - Set HEADLESS=1 to force no-X11 build.
-  - Set USE_HOMEBREW=1 or USE_MACPORTS=1 to prefer those trees.
-========================================================
-EON
+If you want the GUI and have XQuartz:
+  open -a XQuartz
+  xhost +localhost   # first time only
+  source ~/.eda/sky130/activate
+  DISPLAY=:0 magic &
+
+Headless mode (no XQuartz):
+  source ~/.eda/sky130/activate
+  magic -dnull -noconsole
+EOF
