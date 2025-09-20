@@ -110,3 +110,110 @@ SRCDIR="$(cd "$BUILDROOT"/magic-"$TAG" && pwd)"
 [ -d "$SRCDIR" ] || err "Unpack failed; source dir missing."
 
 log "Source directory: $SRCDIR"
+cd "$SRCDIR"
+
+# -------------------------
+# Configure
+# -------------------------
+CFG_ARGS=( "--prefix=$PREFIX" )
+
+# Wire Tcl/Tk if we have a prefix
+if [ -n "$TCLTK_PREFIX" ]; then
+  CFG_ARGS+=( "--with-tcl=${TCLTK_PREFIX}/lib" "--with-tk=${TCLTK_PREFIX}/lib" )
+fi
+
+# X11 (headers & libs)
+if [ -d "/opt/X11/include" ]; then
+  CFG_ARGS+=( "--x-includes=/opt/X11/include" )
+fi
+if [ -d "/opt/X11/lib" ]; then
+  CFG_ARGS+=( "--x-libraries=/opt/X11/lib" )
+fi
+
+# Prefer Cairo & OpenGL if available
+# (If pkg-config exists, great; otherwise configure will fall back)
+if command -v pkg-config >/dev/null 2>&1; then
+  if pkg-config --exists cairo; then
+    CFG_ARGS+=( "--enable-cairo-offscreen" )
+  fi
+fi
+
+CFG_ARGS+=( "--with-opengl" )
+
+log "Running ./configure ${CFG_ARGS[*]}"
+./configure "${CFG_ARGS[@]}"
+
+# -------------------------
+# Generate database/database.h (serialize makedbh)
+# -------------------------
+log "Generating database/database.h (serialized)…"
+[ -f "./scripts/makedbh" ] || err "scripts/makedbh missing in source tree."
+if [ -z "${TCLSH:-}" ]; then
+  # Fall back to whatever configure found
+  TCLSH_FALLBACK="$(grep -E 'TCLSH[[:space:]]*=' Makefile 2>/dev/null | sed -E 's/^[^=]+=//;s/[[:space:]]+$//' || true)"
+  if [ -n "$TCLSH_FALLBACK" ] && [ -x "$TCLSH_FALLBACK" ]; then
+    TCLSH="$TCLSH_FALLBACK"
+  fi
+fi
+[ -n "${TCLSH:-}" ] || err "No tclsh available to run makedbh."
+
+"$TCLSH" ./scripts/makedbh ./database/database.h.in database/database.h \
+  || err "makedbh failed."
+[ -s ./database/database.h ] || err "database/database.h not generated."
+
+# -------------------------
+# Build & install
+# -------------------------
+log "Building Magic…"
+make -j"$JOBS" || { warn "Parallel build failed; retrying serial make for clearer error…"; make -j1; }
+
+log "Installing Magic…"
+make install
+
+# -------------------------
+# Post-install helpers
+# -------------------------
+# Ensure the installed binary is reachable (some users rely on $PREFIX/bin first)
+MAGIC_BIN="$PREFIX/bin/magic"
+if [ ! -x "$MAGIC_BIN" ]; then
+  # Occasionally, make install might place it with weird perms; fix:
+  if [ -f "$MAGIC_BIN" ]; then chmod +x "$MAGIC_BIN" || true; fi
+fi
+
+if [ -x "$MAGIC_BIN" ]; then
+  log "Magic installed at: $MAGIC_BIN"
+else
+  err "Magic binary not found/executable at $MAGIC_BIN after install."
+fi
+
+# Create a simple wrapper (optional) to ensure DISPLAY for GUI launches
+WRAPPER="$PREFIX/bin/magic-gui"
+cat > "$WRAPPER" <<'EOF'
+#!/usr/bin/env bash
+# Simple GUI launcher that ensures XQuartz is running.
+set -Eeuo pipefail
+if ! pgrep -x XQuartz >/dev/null 2>&1; then
+  open -a XQuartz
+  # Give XQuartz a moment to come up
+  sleep 2
+fi
+# DISPLAY is typically set by XQuartz automatically; if not, set a sane default
+export DISPLAY="${DISPLAY:-:0}"
+exec magic "$@"
+EOF
+chmod +x "$WRAPPER"
+
+# -------------------------
+# Final hints
+# -------------------------
+log "Done."
+log "If your PATH doesn't include '$PREFIX/bin', add it or source your env:"
+if [ -f "$ACTIVATE" ]; then
+  printf '  source "%s"\n' "$ACTIVATE"
+else
+  printf '  echo '\''export PATH="%s/bin:$PATH"'\'' >> ~/.zshrc && source ~/.zshrc\n' "$PREFIX"
+fi
+printf 'Then try:\n'
+printf '  magic -rcfile /dev/null -d X11 &   # start GUI (no PDK)\n'
+printf 'or use the wrapper:\n'
+printf '  magic-gui &\n'
