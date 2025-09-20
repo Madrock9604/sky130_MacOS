@@ -1,178 +1,112 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# scripts/20_magic.sh
+# Build & install Magic VLSI on macOS with XQuartz + X11 Tcl/Tk.
+# - No local edits needed beyond running this script from GitHub.
+# - Solves the database/database.h generation race by serializing makedbh.
+# - Installs to ${PREFIX:-$HOME/eda}
+# - Uses X11 Tcl/Tk from one of: ~/.eda/x11-tcltk, /opt/local, /usr/local/opt2/tcl-tk, /opt/homebrew/opt/tcl-tk (last resort).
 
-# ===== Config (can be overridden via env) =====
-: "${PREFIX:="$HOME/.eda"}"
-: "${ENVROOT:="$HOME/.eda/sky130"}"
-: "${X11_TCLTK_PREFIX:="$HOME/.eda/x11-tcltk"}"
-: "${TCL_VER:="8.6.13"}"
-: "${TK_VER:="8.6.13"}"
-: "${MAGIC_VER:="8.3.552"}"
-: "${MAGIC_URL:="https://github.com/RTimothyEdwards/magic/archive/refs/tags/${MAGIC_VER}.tar.gz"}"
+set -Eeuo pipefail
 
-BIN_DIR="$ENVROOT/bin"
-ACTIVATE="$ENVROOT/activate"
+# -------------------------
+# Helpers
+# -------------------------
+log() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+err() { printf '\033[1;31m[ERR ]\033[0m %s\n' "$*" >&2; exit 1; }
 
-mkdir -p "$BIN_DIR"
-mkdir -p "$PREFIX/src"
-WORKDIR="$(mktemp -d /tmp/magic-x11.XXXXXX)"
-cleanup() { rm -rf "$WORKDIR"; }
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || err "Required command '$1' not found."
+}
+
+# -------------------------
+# Settings (overridable via env)
+# -------------------------
+PREFIX="${PREFIX:-"$HOME/eda"}"
+MAGIC_VER="${MAGIC_VER:-8.3.552}"   # tag from R. Timothy Edwards repo
+JOBS="${JOBS:-"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"}"
+
+# Known X11 Tcl/Tk homes to probe (first hit wins)
+X11_TCLTK_CANDIDATES=(
+  "$HOME/.eda/x11-tcltk"
+  "/opt/local"                 # MacPorts
+  "/usr/local/opt2/tcl-tk"     # From the manual X11 build instructions
+  "/opt/homebrew/opt/tcl-tk"   # Homebrew (often Aqua, may still work)
+)
+
+# -------------------------
+# Pre-flight
+# -------------------------
+case "$(uname -s)" in
+  Darwin) : ;;
+  *) err "This script targets macOS (Darwin) only." ;;
+esac
+
+require_cmd curl
+require_cmd tar
+require_cmd make
+require_cmd gcc
+
+# XQuartz check
+if [ -d "/opt/X11" ]; then
+  log "X11 detected at /opt/X11 (XQuartz)."
+else
+  warn "XQuartz not found at /opt/X11."
+  warn "Install XQuartz first (Homebrew: 'brew install --cask xquartz'), then re-run."
+  # We won't hard-fail; you can still do a headless build, but GUI won't work.
+fi
+
+# Tcl/Tk (X11) probe
+TCLTK_PREFIX=""
+for d in "${X11_TCLTK_CANDIDATES[@]}"; do
+  if [ -d "$d" ] && [ -e "$d/lib" ]; then
+    TCLTK_PREFIX="$d"
+    break
+  fi
+done
+[ -n "$TCLTK_PREFIX" ] || warn "Could not find an X11 Tcl/Tk prefix. We'll still try, but you may get 'X11: no' in configure."
+
+# A tclsh to run makedbh
+TCLSH=""
+for cand in \
+  "$TCLTK_PREFIX/bin/tclsh8.6" \
+  "$TCLTK_PREFIX/bin/tclsh" \
+  "$(command -v tclsh8.6 || true)" \
+  "$(command -v tclsh || true)"
+do
+  if [ -n "${cand:-}" ] && [ -x "$cand" ]; then TCLSH="$cand"; break; fi
+done
+[ -n "$TCLSH" ] || warn "No 'tclsh' found yet; configure may still locate Tcl/Tk via --with-tcl/--with-tk paths."
+
+# Install root
+mkdir -p "$PREFIX"/{bin,lib} >/dev/null 2>&1 || true
+log "Using install PREFIX: $PREFIX"
+
+# Optional project env
+ACTIVATE="$HOME/.eda/sky130/activate"
+if [ -f "$ACTIVATE" ]; then
+  log "Found project environment at: $ACTIVATE"
+else
+  warn "Project env '$ACTIVATE' not found. We'll proceed anyway."
+fi
+
+# -------------------------
+# Fetch Magic source
+# -------------------------
+TAG="$MAGIC_VER"
+ARCHIVE_URL="https://github.com/RTimothyEdwards/magic/archive/refs/tags/${TAG}.tar.gz"
+
+BUILDROOT="$(mktemp -d -t magic-remote-build-XXXXXX)"
+cleanup() { rm -rf "$BUILDROOT"; }
 trap cleanup EXIT
 
-log() { printf '[INFO] %s\n' "$*"; }
-warn() { printf '[WARN] %s\n' "$*" >&2; }
-err() { printf '[ERR ] %s\n' "$*" >&2; exit 1; }
+log "Downloading Magic ${TAG}…"
+curl -fsSL "$ARCHIVE_URL" -o "$BUILDROOT/magic-${TAG}.tar.gz" \
+  || err "Failed to download $ARCHIVE_URL"
 
-# ===== Homebrew + deps =====
-ensure_brew() {
-  if ! command -v brew >/dev/null 2>&1; then
-    log "Installing Homebrew…"
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    eval "$(/opt/homebrew/bin/brew shellenv || true)"
-    eval "$(/usr/local/bin/brew shellenv || true)"
-  fi
-  # shellcheck disable=SC2046
-  eval "$($(command -v brew) shellenv)"
-}
+log "Unpacking…"
+tar -xzf "$BUILDROOT/magic-${TAG}.tar.gz" -C "$BUILDROOT"
+SRCDIR="$(cd "$BUILDROOT"/magic-"$TAG" && pwd)"
+[ -d "$SRCDIR" ] || err "Unpack failed; source dir missing."
 
-brew_deps() {
-  log "Installing brew deps (OK if already present)…"
-  brew install pkg-config wget coreutils libx11 cairo libglu freeglut || true
-  brew install --cask xquartz || true
-}
-
-# ===== Build Tcl/Tk (X11) locally (no sudo) =====
-build_tcl() {
-  log "Building Tcl ${TCL_VER} (X11-agnostic core)…"
-  cd "$WORKDIR"
-  local TARBALL="tcl${TCL_VER}-src.tar.gz"
-  local URL="https://prdownloads.sourceforge.net/tcl/${TARBALL}"
-  curl -fsSL "$URL" -o "$TARBALL"
-  tar xfz "$TARBALL"
-  cd "tcl${TCL_VER}/unix"
-  ./configure --prefix="$X11_TCLTK_PREFIX"
-  make -j"$(sysctl -n hw.ncpu || echo 4)"
-  make install
-}
-
-build_tk() {
-  log "Building Tk ${TK_VER} (with X11)…"
-  cd "$WORKDIR"
-  local TARBALL="tk${TK_VER}-src.tar.gz"
-  local URL="https://prdownloads.sourceforge.net/tcl/${TARBALL}"
-  curl -fsSL "$URL" -o "$TARBALL"
-  tar xfz "$TARBALL"
-  cd "tk${TK_VER}/unix"
-
-  # Determine brew/XQuartz prefixes
-  local BREW_PREFIX; BREW_PREFIX="$(brew --prefix)"
-  local XQ_PREFIX="/opt/X11"
-
-  ./configure \
-    --prefix="$X11_TCLTK_PREFIX" \
-    --with-tcl="$X11_TCLTK_PREFIX/lib" \
-    --with-x \
-    --x-includes="${XQ_PREFIX}/include" \
-    --x-libraries="${XQ_PREFIX}/lib"
-  make -j"$(sysctl -n hw.ncpu || echo 4)"
-  make install
-}
-
-# ===== Build Magic against our X11 Tcl/Tk =====
-build_magic() {
-  log "Fetching Magic ${MAGIC_VER}…"
-  cd "$WORKDIR"
-  curl -fsSL "$MAGIC_URL" -o "magic-${MAGIC_VER}.tar.gz"
-  tar xfz "magic-${MAGIC_VER}.tar.gz"
-  cd "magic-${MAGIC_VER}"
-
-  local XQ_PREFIX="/opt/X11"
-  local CAIRO_PREFIX; CAIRO_PREFIX="$(brew --prefix cairo)"
-
-  log "Configuring Magic (X11 Tk)…"
-  ./configure \
-    --prefix="$PREFIX" \
-    --with-tcl="$X11_TCLTK_PREFIX/lib" \
-    --with-tk="$X11_TCLTK_PREFIX/lib" \
-    --with-cairo="${CAIRO_PREFIX}" \
-    --x-includes="${XQ_PREFIX}/include" \
-    --x-libraries="${XQ_PREFIX}/lib" \
-    --enable-cairo-offscreen
-
-  log "Building Magic…"
-  make -j"$(sysctl -n hw.ncpu || echo 4)"
-  log "Installing Magic to $PREFIX …"
-  make install
-}
-
-# ===== Env + wrapper =====
-write_env() {
-  log "Updating environment at $ACTIVATE …"
-  mkdir -p "$(dirname "$ACTIVATE")"
-  cat >"$ACTIVATE" <<EOF
-# SKY130 environment (Magic X11 build)
-export EDA_PREFIX="$PREFIX"
-export PATH="\$EDA_PREFIX/bin:\$PATH"
-# Prefer our X11 Tcl/Tk at runtime
-export TCLLIBPATH="$X11_TCLTK_PREFIX/lib"
-export LD_LIBRARY_PATH="$X11_TCLTK_PREFIX/lib:\$LD_LIBRARY_PATH"
-export DYLD_LIBRARY_PATH="$X11_TCLTK_PREFIX/lib:\$DYLD_LIBRARY_PATH"
-# XQuartz DISPLAY (launchctl is more accurate; fallback provided)
-export DISPLAY="\${DISPLAY:-\$(launchctl getenv DISPLAY 2>/dev/null || echo :0)}"
-EOF
-}
-
-write_wrapper() {
-  log "Writing wrapper $BIN_DIR/magic …"
-  cat >"$BIN_DIR/magic" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-# Ensure our env is loaded if present
-ACT="$HOME/.eda/sky130/activate"
-[ -f "$ACT" ] && # shellcheck disable=SC1090
-source "$ACT"
-
-exec "$EDA_PREFIX/bin/magic" -d X11 "$@"
-EOF
-  chmod +x "$BIN_DIR/magic"
-  log "Wrapper created: $BIN_DIR/magic"
-}
-
-# ===== XQuartz bring-up & smoke test =====
-start_x() {
-  log "Ensuring XQuartz is running…"
-  open -a XQuartz || true
-  # give it a moment
-  sleep 2
-  # best-effort DISPLAY from launchd
-  export DISPLAY="$(launchctl getenv DISPLAY || true)"
-  [ -z "${DISPLAY:-}" ] && export DISPLAY=":0"
-  command -v xhost >/dev/null 2>&1 && xhost +localhost >/dev/null 2>&1 || true
-  log "DISPLAY=${DISPLAY:-unset}"
-}
-
-smoke_test() {
-  log "Running Magic smoke test (no GUI draw, just init)…"
-  # If GUI crashes immediately, this still returns interpreter version
-  "$BIN_DIR/magic" -noconsole -dnull <<<'version; quit -noprompt' || true
-  log "Now try launching GUI:  magic  (or: magic -d X11)"
-}
-
-# ===== Main =====
-log "Using PREFIX: $PREFIX"
-log "X11 Tcl/Tk prefix: $X11_TCLTK_PREFIX"
-log "Env root: $ENVROOT"
-
-ensure_brew
-brew_deps
-build_tcl
-build_tk
-build_magic
-write_env
-write_wrapper
-start_x
-smoke_test
-
-log "Done. Source your env, then run Magic:"
-echo '  source "$HOME/.eda/sky130/activate"'
-echo '  magic    # should open X11 GUI'
+log "Source directory: $SRCDIR"
