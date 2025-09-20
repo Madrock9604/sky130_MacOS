@@ -132,4 +132,46 @@ if [[ "$DO_CLEAN" -eq 1 ]]; then
 fi
 
 # Pre-generate the header (fixes database/database.h not found)
-lo
+log "Generating database/database.h with Tcl 8.6..."
+"$TCLSH" ./scripts/makedbh ./database/database.h.in ./database/database.h
+[[ -f ./database/database.h ]] || err "Failed to create database/database.h"
+
+# Configure (no X11)
+log "Configuring Magic (no X11, Tcl/Tk 8.6)..."
+./configure \
+  --prefix="${PREFIX}" \
+  --with-x=no \
+  --with-tcl="${TCLTK_LIB}" \
+  --with-tk="${TCLTK_LIB}" \
+  --with-tclsh="${TCLSH}" \
+  --with-wish="${WISH}"
+
+# Build & install
+log "Building..."
+make -j"$(sysctl -n hw.ncpu)"
+
+log "Installing to ${PREFIX}..."
+make install
+
+# Smoke test (headless)
+log "Smoke test (headless)..."
+"${PREFIX}/bin/magic" -dnull -noconsole -nowindow -rcfile /dev/null -T minimum <<<'quit' >/dev/null || {
+  warn "Headless test failed; Magic installed anyway. Try running ${PREFIX}/bin/magic manually."
+}
+
+cat <<'EOF'
+
+Done.
+
+Installed binaries include:
+  ${PREFIX}/bin/magic
+  ${PREFIX}/bin/ext2spice
+
+Notes:
+  - This build uses Aqua Tk (no X11). Do not set DISPLAY.
+  - If X11 libs are installed, that's fine; we forced --with-x=no.
+
+Tip:
+  export PATH="${PREFIX}/bin:$PATH"
+
+EOF
