@@ -1,171 +1,206 @@
 #!/usr/bin/env bash
-# Install Magic from source on macOS using only this script.
-# Safe to run directly from a GitHub raw link.
+# 20_magic.sh — build & install Magic from source on macOS (Apple Silicon or Intel)
+# Designed to be run directly from GitHub, e.g.:
+#   curl -fsSL https://raw.githubusercontent.com/Madrock9604/sky130_MacOS/refs/heads/main/scripts/20_magic.sh | bash -s --
+#
+# You can override defaults via env vars before running, e.g.:
+#   PREFIX="$HOME/eda" MAGIC_URL="https://github.com/RTimothyEdwards/magic/archive/refs/tags/8.3.552.tar.gz" bash 20_magic.sh
 
 set -euo pipefail
 
-log(){ printf "[INFO] %s\n" "$*"; }
-warn(){ printf "[WARN] %s\n" "$*" >&2; }
-die(){ printf "[ERR ] %s\n" "$*" >&2; exit 1; }
+# -----------------------------
+# Configurable defaults
+# -----------------------------
+: "${PREFIX:="$HOME/eda"}"                                      # install prefix
+: "${JOBS:="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"}"       # build parallelism
+: "${MAGIC_URL:="https://github.com/RTimothyEdwards/magic/archive/refs/tags/8.3.552.tar.gz"}"
 
-# -------------------- Config (override via env or flags) --------------------
-# Magic release tarball; change MAGIC_URL if you want a different version.
-MAGIC_URL="${MAGIC_URL:-https://github.com/RTimothyEdwards/magic/archive/refs/tags/8.3.552.tar.gz}"
+# If you want to force specific toolchains, you can pre-set these:
+: "${TCLSH:=}"             # e.g. /opt/local/bin/tclsh8.6 or /opt/homebrew/opt/tcl-tk/bin/tclsh8.6
+: "${TCLTK_PREFIX:=}"      # e.g. /opt/local (MacPorts) or /opt/homebrew/opt/tcl-tk (Homebrew)
+: "${WITH_X:=auto}"        # auto|yes|no
+: "${X11_PREFIX:=/opt/X11}"# XQuartz default
 
-# Where to install Magic
-PREFIX="${PREFIX:-$HOME/eda}"
+log() { printf "\033[1;34m[INFO]\033[0m %s\n" "$*"; }
+warn(){ printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
+die() { printf "\033[1;31m[ERR ]\033[0m %s\n" "$*" >&2; exit 1; }
 
-# Optionally point at a specific Tcl/Tk 8.6 prefix (contains bin/tclsh8.6, bin/wish8.6)
-TCLTK_PREFIX="${TCLTK_PREFIX:-}"
-
-# Parallel build jobs
-JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
-
-# -------------------- CLI flags --------------------
-usage(){
-  cat <<EOF
-Usage: $0 [options]
-
-Options:
-  --prefix=DIR           Install prefix (default: \$HOME/eda)
-  --magic-url=URL        Source tarball URL (default: $MAGIC_URL)
-  --tcltk-prefix=DIR     Tcl/Tk 8.6 prefix (has bin/tclsh8.6 and bin/wish8.6)
-  --jobs=N               make -jN (default: detected CPU count)
-  -h|--help              Show this help
-
-Environment overrides:
-  PREFIX, MAGIC_URL, TCLTK_PREFIX, JOBS
-EOF
-}
-
-for a in "$@"; do
-  case "$a" in
-    --prefix=*)        PREFIX="${a#*=}";;
-    --magic-url=*)     MAGIC_URL="${a#*=}";;
-    --tcltk-prefix=*)  TCLTK_PREFIX="${a#*=}";;
-    --jobs=*)          JOBS="${a#*=}";;
-    -h|--help)         usage; exit 0;;
-    *) die "Unknown option: $a. Try --help";;
-  esac
-done
-
-[[ "$(uname -s)" == "Darwin" ]] || die "This script targets macOS."
-command -v tar >/dev/null || die "tar not found"
-command -v make >/dev/null || die "make not found"
-if ! command -v curl >/dev/null && ! command -v wget >/dev/null; then
-  die "Need curl or wget"
-fi
-
-# -------------------- Find Tcl/Tk 8.6 --------------------
-have(){ command -v "$1" >/dev/null 2>&1; }
-
-find_tcl86(){
-  # 1) explicit
-  if [[ -n "$TCLTK_PREFIX" ]]; then
-    [[ -x "$TCLTK_PREFIX/bin/tclsh8.6" && -x "$TCLTK_PREFIX/bin/wish8.6" ]] \
-      && { echo "$TCLTK_PREFIX"; return; }
-    die "--tcltk-prefix does not contain tclsh8.6 and wish8.6: $TCLTK_PREFIX"
-  fi
-  # 2) MacPorts
-  [[ -x /opt/local/bin/tclsh8.6 && -x /opt/local/bin/wish8.6 ]] && { echo /opt/local; return; }
-  # 3) Homebrew (tcl-tk@8.6 or tcl-tk)
-  if have brew; then
-    for f in tcl-tk@8.6 tcl-tk; do
-      if brew --prefix "$f" >/dev/null 2>&1; then
-        p="$(brew --prefix "$f")"
-        [[ -x "$p/bin/tclsh8.6" && -x "$p/bin/wish8.6" ]] && { echo "$p"; return; }
-      fi
+# -----------------------------
+# Detect Tcl/Tk (MacPorts/Homebrew)
+# -----------------------------
+detect_tcltk() {
+  if [[ -n "${TCLSH}" && -x "${TCLSH}" ]]; then
+    log "Using TCLSH (pre-set): ${TCLSH}"
+  else
+    # Prefer Tcl/Tk 8.6 (Magic is known-good), then 9.0 if present.
+    for c in \
+      /opt/local/bin/tclsh8.6 \
+      /opt/local/bin/tclsh \
+      /opt/homebrew/opt/tcl-tk/bin/tclsh8.6 \
+      /opt/homebrew/opt/tcl-tk/bin/tclsh9.0 \
+      /usr/local/opt/tcl-tk/bin/tclsh8.6 \
+      /usr/bin/tclsh; do
+      if [[ -x "$c" ]]; then TCLSH="$c"; break; fi
     done
+    [[ -n "${TCLSH}" ]] || die "Tcl/Tk not found. Install via MacPorts (sudo port install tk) or Homebrew (brew install tcl-tk)."
+    log "Detected TCLSH: ${TCLSH}"
   fi
-  # 4) common custom location
-  [[ -x "$HOME/opt/tcl86/bin/tclsh8.6" && -x "$HOME/opt/tcl86/bin/wish8.6" ]] \
-    && { echo "$HOME/opt/tcl86"; return; }
-  return 1
+
+  if [[ -n "${TCLTK_PREFIX}" ]]; then
+    log "Using TCL/TK prefix (pre-set): ${TCLTK_PREFIX}"
+  else
+    case "${TCLSH}" in
+      /opt/local/*)                 TCLTK_PREFIX="/opt/local" ;;
+      /opt/homebrew/opt/tcl-tk/*)   TCLTK_PREFIX="/opt/homebrew/opt/tcl-tk" ;;
+      /usr/local/opt/tcl-tk/*)      TCLTK_PREFIX="/usr/local/opt/tcl-tk" ;;
+      *)                            TCLTK_PREFIX="$(dirname "$(dirname "$TCLSH")")" ;;
+    esac
+    log "TCL/TK prefix: ${TCLTK_PREFIX}"
+  fi
 }
 
-if ! TCLTK_PREFIX="$(find_tcl86)"; then
-  cat <<'EOF' >&2
-[ERR ] Tcl/Tk 8.6 not found.
-       Please install via MacPorts (sudo port install tcl tk +quartz) or Homebrew:
-         brew install tcl-tk@8.6
-       Then re-run, or pass --tcltk-prefix=DIR.
+# -----------------------------
+# Detect X11 (XQuartz)
+# -----------------------------
+detect_x11() {
+  local have_headers="${X11_PREFIX}/include/X11/Xlib.h"
+  local have_lib="${X11_PREFIX}/lib/libX11.dylib"
+  if [[ "${WITH_X}" == "no" ]]; then
+    WITH_X="no"
+  elif [[ -f "${have_headers}" && -f "${have_lib}" ]]; then
+    WITH_X="yes"
+  else
+    if [[ "${WITH_X}" == "yes" ]]; then
+      warn "WITH_X=yes requested but XQuartz headers/libs not found under ${X11_PREFIX}. Proceeding without X11."
+      WITH_X="no"
+    else
+      WITH_X="no"
+    fi
+  fi
+
+  if [[ "${WITH_X}" == "yes" ]]; then
+    log "X11 detected at ${X11_PREFIX} (XQuartz). Magic will build with GUI."
+  else
+    warn "X11 not found. Magic will build in batch mode (-dnull). Install XQuartz if you want GUI: https://www.xquartz.org/"
+  fi
+}
+
+# -----------------------------
+# Prep directories
+# -----------------------------
+prep_dirs() {
+  mkdir -p "${PREFIX}/bin" "${PREFIX}/lib" "${PREFIX}/share"
+}
+
+# -----------------------------
+# Download & unpack magic
+# -----------------------------
+fetch_and_unpack() {
+  TMPROOT="$(mktemp -d -t magic-remote-build-XXXXXX)"
+  trap 'rm -rf "${TMPROOT}"' EXIT
+
+  log "Downloading source archive: ${MAGIC_URL}"
+  ARCHIVE="${TMPROOT}/magic.tar.gz"
+  curl -fL "${MAGIC_URL}" -o "${ARCHIVE}" || die "Download failed."
+
+  log "Unpacking…"
+  tar -xzf "${ARCHIVE}" -C "${TMPROOT}/" || die "Extract failed."
+
+  # Determine top directory name inside tarball
+  MAGIC_SRCDIR="$(tar -tzf "${ARCHIVE}" | head -1 | cut -d/ -f1)"
+  [[ -d "${TMPROOT}/${MAGIC_SRCDIR}" ]] || die "Could not find source dir in archive."
+
+  SRCDIR="${TMPROOT}/${MAGIC_SRCDIR}"
+  log "Source directory: ${SRCDIR}"
+}
+
+# -----------------------------
+# Generate database/database.h early (avoids parallel race)
+# -----------------------------
+generate_db_header() {
+  log "Generating database/database.h with ${TCLSH}…"
+  pushd "${SRCDIR}" >/dev/null
+
+  # Ensure scripts/makedbh exists
+  [[ -f "./scripts/makedbh" ]] || die "scripts/makedbh missing in source tree."
+
+  # Run makedbh (same as what Makefile does, but we do it up-front)
+  chmod +x ./scripts/makedbh || true
+  "${TCLSH}" ./scripts/makedbh ./database/database.h.in ./database/database.h \
+    || die "makedbh failed."
+
+  popd >/dev/null
+}
+
+# -----------------------------
+# Configure, build, install
+# -----------------------------
+build_and_install() {
+  pushd "${SRCDIR}" >/dev/null
+
+  # Flags to help find Tcl/Tk & X11 where needed.
+  local cfg_args=()
+  cfg_args+=( "--prefix=${PREFIX}" )
+  cfg_args+=( "--with-tcl=${TCLTK_PREFIX}/lib" )
+  cfg_args+=( "--with-tk=${TCLTK_PREFIX}/lib" )
+
+  if [[ "${WITH_X}" == "yes" ]]; then
+    cfg_args+=( "--with-x" "--x-includes=${X11_PREFIX}/include" "--x-libraries=${X11_PREFIX}/lib" )
+  else
+    cfg_args+=( "--with-x=no" )
+  fi
+
+  log "Configuring: ./configure ${cfg_args[*]}"
+  ./configure "${cfg_args[@]}"
+
+  log "Building (make -j${JOBS})…"
+  make -j"${JOBS}"
+
+  log "Installing (make install)…"
+  make install
+
+  popd >/dev/null
+}
+
+# -----------------------------
+# Post-install notes
+# -----------------------------
+post_install() {
+  local magic_bin="${PREFIX}/bin/magic"
+  if [[ -x "${magic_bin}" ]]; then
+    log "Magic installed: ${magic_bin}"
+    cat <<EOF
+
+Add to your PATH (if not already):
+  export PATH="${PREFIX}/bin:\$PATH"
+
+Run in batch mode (no GUI):
+  magic -dnull -noconsole
+
 EOF
-  exit 1
-fi
-
-TCLSH="$TCLTK_PREFIX/bin/tclsh8.6"
-WISH="$TCLTK_PREFIX/bin/wish8.6"
-TCLTK_LIB="$TCLTK_PREFIX/lib"
-log "Using Tcl/Tk 8.6 at: $TCLTK_PREFIX"
-
-# -------------------- Fetch & unpack Magic --------------------
-WORK="$(mktemp -d /tmp/magic-build-XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
-
-SRC_TGZ="$WORK/src.tgz"
-if command -v curl >/dev/null; then
-  log "Downloading Magic: $MAGIC_URL"
-  curl -fsSL "$MAGIC_URL" -o "$SRC_TGZ"
-else
-  log "Downloading Magic (wget): $MAGIC_URL"
-  wget -q "$MAGIC_URL" -O "$SRC_TGZ"
-fi
-
-log "Unpacking…"
-mkdir -p "$WORK/unpack"
-tar xf "$SRC_TGZ" -C "$WORK/unpack"
-# take the first top-level dir as source root
-SRC_DIR="$(find "$WORK/unpack" -mindepth 1 -maxdepth 1 -type d | head -n1)"
-[[ -n "$SRC_DIR" && -d "$SRC_DIR" ]] || die "Could not locate unpacked source directory"
-log "Source at: $SRC_DIR"
-
-# -------------------- Configure, build, install --------------------
-export PATH="$TCLTK_PREFIX/bin:$PATH"
-
-cd "$SRC_DIR"
-
-# If coming from a clean tarball, these are no-ops; we silence errors.
-make distclean >/dev/null 2>&1 || true
-
-# On your machine, X11/wish path was segfaulting. We explicitly disable X11.
-# Also skip OpenGL/Cairo to keep it simple.
-log "Configuring (disable X11/OpenGL/Cairo)…"
-./configure \
-  --prefix="$PREFIX" \
-  --with-x=no \
-  --with-opengl=no \
-  --with-cairo=no \
-  --with-tcl="$TCLTK_LIB" \
-  --with-tk="$TCLTK_LIB" \
-  --with-tclsh="$TCLSH" \
-  --with-wish="$WISH"
-
-# Make sure the auto-generated header exists (do this *after* configure)
-log "Generating database/database.h…"
-make -j1 database/database.h
-
-log "Building (jobs=$JOBS)…"
-make -j"$JOBS"
-
-log "Installing to $PREFIX…"
-make install
-
-# -------------------- Quick smoke test (headless) --------------------
-if "$PREFIX/bin/magic" -dnull -noconsole -nowindow -rcfile /dev/null -T minimum <<<'quit' >/dev/null 2>&1; then
-  log "Headless smoke test passed."
-else
-  warn "Headless smoke test failed; Magic installed, but GUI/techfile may need attention."
-fi
-
-cat <<EOF
-
-✅ Done.
-
-Installed to: $PREFIX
-Add to your shell rc:
-  export PATH="$PREFIX/bin:\$PATH"
-
-Notes:
-  • Built **without X11** to avoid libX11/wish crashes on your setup.
-  • If you later want a GUI via X11, rebuild without --with-x=no *after* you have working XQuartz/X11 headers and libs.
+    if [[ "${WITH_X}" == "yes" ]]; then
+      cat <<'EOF'
+GUI mode (requires XQuartz running):
+  # Start XQuartz first, or ensure DISPLAY is set
+  magic
 EOF
+      echo
+    else
+      warn "Built without X11. Rebuild with XQuartz installed to enable GUI."
+    fi
+  else
+    die "Install completed but ${magic_bin} not found/executable."
+  fi
+}
+
+# =============================
+# Main
+# =============================
+log "Using install PREFIX: ${PREFIX}"
+prep_dirs
+detect_tcltk
+detect_x11
+fetch_and_unpack
+generate_db_header
+build_and_install
+post_install
