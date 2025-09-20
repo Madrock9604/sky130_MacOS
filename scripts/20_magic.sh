@@ -46,18 +46,45 @@ eval "$("$BREW_BIN" shellenv)"
 ok "Homebrew ready: $BREW_BIN"
 
 # ---------- Deps (idempotent) ----------
-# NOTE: We explicitly require Tcl/Tk 8.6 to avoid Tk 9 GUI breakage with openwrapper.
-need_pkgs=( tcl-tk@8.6 cairo pkg-config gawk make )
+# NOTE: We need Tk 8.6 to avoid Tk 9 GUI breakage with openwrapper.
+
+# Install non-Tk deps first (guarded for set -u)
+need_pkgs=( cairo pkg-config gawk make )
+set +u
 for pkg in "${need_pkgs[@]}"; do
   if ! brew list --versions "$pkg" >/dev/null 2>&1; then
     info "Installing $pkg…"
-    brew install "$pkg" || true
+    brew install "$pkg"
   fi
 done
-# Fallback if @8.6 keg name differs:
-if ! brew list --versions tcl-tk@8.6 >/dev/null 2>&1; then
-  brew list --versions tcl-tk@8 >/dev/null 2>&1 || brew install tcl-tk@8
+set -u
+
+# Install a Tk 8.6 keg (some brews name it @8)
+if brew list --versions tcl-tk@8 >/dev/null 2>&1; then
+  : # already have @8
+elif brew list --versions tcl-tk >/dev/null 2>&1; then
+  : # plain tcl-tk may be 8.6 on some setups
+else
+  info "Installing Tcl/Tk 8.x…"
+  brew install tcl-tk@8 || brew install tcl-tk
 fi
+
+# Resolve a prefix that is truly 8.6
+TK86_PREFIX=""
+for cand in \
+  "$(brew --prefix tcl-tk@8 2>/dev/null)" \
+  "$(brew --prefix tcl-tk 2>/dev/null)"
+do
+  [ -n "$cand" ] || continue
+  if [ -f "$cand/lib/tclConfig.sh" ] && grep -q 'TCL_VERSION=8\.6' "$cand/lib/tclConfig.sh"; then
+    TK86_PREFIX="$cand"
+    break
+  fi
+done
+
+[ -n "${TK86_PREFIX:-}" ] || fail "Could not find a Tcl/Tk **8.6** keg via Homebrew. Try: brew reinstall tcl-tk@8"
+info "Using Tcl/Tk 8.6 at: $TK86_PREFIX"
+
 
 # ---------- Resolve Tcl/Tk 8.6 keg ----------
 TK86_PREFIX="$(brew --prefix tcl-tk@8.6 2>/dev/null || brew --prefix tcl-tk@8 2>/dev/null || true)"
