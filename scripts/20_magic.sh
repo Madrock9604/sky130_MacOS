@@ -25,7 +25,7 @@ fi
 command -v brew >/dev/null || die "Homebrew not found. Run scripts/00_prereqs_mac.sh first."
 
 # 1) Ensure deps
-brew list --versions git >/dev/null 2>&1 || brew install git
+brew list --versions git   >/dev/null 2>&1 || brew install git
 brew list --versions cairo >/dev/null 2>&1 || brew install cairo
 
 # 2) Locate Tk 8.6 (from prereqs) and verify wish8.6
@@ -35,13 +35,15 @@ TK_VER="$("$TK86_PREFIX/bin/wish8.6" <<< 'puts [info patchlevel]; exit' 2>/dev/n
 [[ "$TK_VER" == 8.6.* ]] || die "wish8.6 reports $TK_VER (need 8.6.x)."
 
 # 3) Build flags (keg-only Tk + Cairo) and **force no OpenGL/3D**
+#    Add missing relative include paths so subdir builds (e.g., cmwind/) see ../database headers.
+EXTRA_INCLUDES="-I. -I.. -I../database -I../utils -I../tiles -I../hash -I../textio -I../commands -I../dbwind"
 export PKG_CONFIG_PATH="$TK86_PREFIX/lib/pkgconfig:$(brew --prefix cairo)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export CPPFLAGS="-I$TK86_PREFIX/include -I$(brew --prefix cairo)/include ${CPPFLAGS:-}"
+export CPPFLAGS="$EXTRA_INCLUDES -I$TK86_PREFIX/include -I$(brew --prefix cairo)/include ${CPPFLAGS:-}"
 export LDFLAGS="-L$TK86_PREFIX/lib -L$(brew --prefix cairo)/lib ${LDFLAGS:-}"
-
-# Make clang forgiving + avoid C23 proto issues.
+# Make clang tolerant of older C patterns used by Magic sources.
 export CFLAGS="${CFLAGS:-} -std=gnu11 -Wno-error -Wno-deprecated-non-prototype"
-# Tell configure/make to pretend OpenGL is not present.
+
+# Tell configure/make to pretend OpenGL does not exist.
 export ac_cv_header_GL_gl_h=no
 export ac_cv_header_OpenGL_gl_h=no
 export ac_cv_lib_GL_glFlush=no
@@ -81,9 +83,9 @@ find . -name 'Makefile' -o -name 'Makefile.in' | while read -r mf; do
   sed -E -i '' 's/[[:space:]]grTOGL[^[:space:]]*\.o//g' "$mf" || true
 done
 
-# 7) Build & install
-info "Building…"
-make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" || die "make failed."
+# 7) Build (serial to avoid edge-ordering issues while stabilizing) & install
+info "Building (serial)…"
+make -j1 || die "make failed."
 info "Installing…"
 make install || die "make install failed."
 
