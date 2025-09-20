@@ -143,19 +143,38 @@ build_magic_from_source(){
     export LDFLAGS="-L$TCLTK_PREFIX/lib ${LDFLAGS-}"
     export PKG_CONFIG_PATH="$TCLTK_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   fi
+
   mkdir -p "$SRC_ROOT" && cd "$SRC_ROOT"
   if [ ! -d magic ]; then
     run "git clone https://github.com/RTimothyEdwards/magic.git"
   fi
   cd magic
+
+  # clean + update
   run "git fetch --all -q && git pull -q"
+  run "make distclean || true"
+  run "git clean -xfd -q || true"
+
+  # Configure (Cocoa Tk; OpenGL off; Cairo on)
   run "./configure --prefix='$MAGIC_PREFIX' --with-x --with-opengl=no --disable-cairo ${TCLTK_PREFIX:+--with-tcl='$TCLTK_PREFIX/lib' --with-tk='$TCLTK_PREFIX/lib' --with-tclinclude='$TCLTK_PREFIX/include' --with-tkinclude='$TCLTK_PREFIX/include'}"
-  run "make -j$CORES"
+
+  # ==== IMPORTANT: avoid race on generated headers ====
+  # Option A (safest for classrooms): full serial build
+  run "make -j1"
+
+  # Option B (faster): uncomment next 3 lines and comment out the serial line above.
+  # First generate the header, then parallel build.
+  # run "make -j1 database/database.h || true"
+  # run "make -j${CORES}"
+  # ================================================
+
   run "make install"
+
   PATH="$MAGIC_PREFIX/bin:$PATH"; export PATH
   command -v magic >/dev/null 2>&1 || fail "Magic built but not found in PATH."
   ok "Magic built and installed to $MAGIC_PREFIX."
 }
+
 
 # Force our Cocoa-Tk Magic to be the 'magic' command now & later
 enforce_user_magic(){
