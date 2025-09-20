@@ -1,64 +1,181 @@
 #!/usr/bin/env bash
+#
+# build-magic-macos.sh
+# One-file macOS builder for Magic (Aqua/Cocoa GUI, no X11).
+#
+# - Requires: macOS + Homebrew
+# - Installs Homebrew deps if missing (tcl-tk, etc.)
+# - Configures Magic to use Brew Tcl/Tk and Aqua (no X11) to avoid colormap/X11 crashes.
+# - Installs under $PREFIX (default: $HOME/eda)
+#
+# Usage:
+#   ./build-magic-macos.sh                # default build (prefix=$HOME/eda, branch=8.3)
+#   PREFIX=/opt/eda ./build-magic-macos.sh
+#   MAGIC_BRANCH=master ./build-magic-macos.sh
+#
 set -euo pipefail
 
-# --- Config ---
-PREFIX="${HOME}/.local/magic-aqua"   # install here (no sudo needed)
-SRC_DIR="${HOME}/src"                # where to clone sources
+### ---------- Config ----------
+: "${PREFIX:="$HOME/eda"}"
+: "${SRCROOT:="$HOME/src"}"
+: "${MAGIC_REPO:="https://github.com/RTimothyEdwards/magic.git"}"
+: "${MAGIC_BRANCH:="8.3"}"     # try "master" if you want bleeding edge
+: "${JOBS:="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"}"
 
-# --- Prereqs (Homebrew) ---
-if ! command -v brew >/dev/null 2>&1; then
-  echo "Homebrew not found. Install from https://brew.sh and re-run."
-  exit 1
+### ---------- Helpers ----------
+log() { printf '\n\033[1;32m[INFO]\033[0m %s\n' "$*"; }
+warn(){ printf '\n\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+die() { printf '\n\033[1;31m[ERR]\033[0m %s\n' "$*"; exit 1; }
+
+### ---------- OS / Brew checks ----------
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  die "This script is macOS-only."
 fi
 
-brew update
-brew install tcl-tk cairo pkg-config git
+if ! command -v brew >/dev/null 2>&1; then
+  die "Homebrew not found. Install from https://brew.sh and re-run."
+fi
 
-HOMEBREW_PREFIX="$(brew --prefix)"               # usually /opt/homebrew on Apple Silicon
-TCLTK_PREFIX="${HOMEBREW_PREFIX}/opt/tcl-tk"
+### ---------- Install deps ----------
+log "Ensuring required Homebrew packages are installed…"
+# tcl-tk provides wish/tclsh headers/libs (Aqua). Others are common build tools.
+brew list --versions tcl-tk >/dev/null 2>&1 || brew install tcl-tk
+brew list --versions pkg-config >/dev/null 2>&1 || brew install pkg-config
+brew list --versions autoconf  >/dev/null 2>&1 || brew install autoconf
+brew list --versions automake  >/dev/null 2>&1 || brew install automake
+brew list --versions libtool   >/dev/null 2>&1 || brew install libtool
+brew list --versions cairo     >/dev/null 2>&1 || brew install cairo
+brew list --versions git       >/dev/null 2>&1 || brew install git
 
-# Make sure we use Homebrew's Tcl/Tk (Aqua), not MacPorts or XQuartz
-export PATH="${TCLTK_PREFIX}/bin:${PATH}"
-export PKG_CONFIG_PATH="${TCLTK_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export CPPFLAGS="-I${TCLTK_PREFIX}/include ${CPPFLAGS:-}"
-export LDFLAGS="-L${TCLTK_PREFIX}/lib ${LDFLAGS:-}"
+BREW_PREFIX="$(brew --prefix)"
+TCL_PREFIX="$(brew --prefix tcl-tk)"   # keg: …/opt/tcl-tk
 
-# Avoid accidental use of X11
-unset DISPLAY || true
+# Put brew Tcl/Tk tools first so we pick up Aqua wish/tclsh.
+export PATH="$TCL_PREFIX/bin:$PATH"
 
-# --- Get Magic source ---
-mkdir -p "${SRC_DIR}"
-cd "${SRC_DIR}"
+# Headers/libs live in multiple dirs depending on Tcl/Tk version (8.6 vs 9.x).
+CPP_DIRS=()
+for d in "$TCL_PREFIX/include" "$TCL_PREFIX/include/tcl8.6" "$TCL_PREFIX/include/tcl8.7" "$TCL_PREFIX/include/tcl9.0"; do
+  [[ -d "$d" ]] && CPP_DIRS+=("-I$d")
+done
+LDPATHS=()
+for d in "$TCL_PREFIX/lib"; do
+  [[ -d "$d" ]] && LDPATHS+=("-L$d")
+done
 
-if [ ! -d magic ]; then
-  # Official upstream mirror
-  git clone --depth=1 https://github.com/RTimothyEdwards/magic.git
+# Cairo pkgconfig lives in brew prefix; Tcl’s .pc files live under the keg.
+export PKG_CONFIG_PATH="$TCL_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export CPPFLAGS="${CPPFLAGS:-} ${CPP_DIRS[*]}"
+export LDFLAGS="${LDFLAGS:-} ${LDPATHS[*]}"
+
+# Locate tclsh/wish from Brew keg
+TCLSH="$(command -v tclsh || true)"
+WISH="$(command -v wish || true)"
+[[ -x "$TCLSH" ]] || die "tclsh not found in PATH ($PATH)"
+[[ -x "$WISH"  ]] || die "wish not found in PATH ($PATH)"
+
+log "Using Tcl/Tk from: $TCL_PREFIX"
+log "tclsh: $TCLSH"
+log "wish : $WISH"
+log "CPPFLAGS: $CPPFLAGS"
+log "LDFLAGS : $LDFLAGS"
+log "PKG_CONFIG_PATH: ${PKG_CONFIG_PATH:-<empty>}"
+
+### ---------- Prepare dirs ----------
+mkdir -p "$SRCROOT" "$PREFIX"
+log "Source root: $SRCROOT"
+log "Install prefix: $PREFIX"
+
+### ---------- Fetch Magic ----------
+cd "$SRCROOT"
+if [[ -d magic/.git ]]; then
+  log "Found existing magic repo, fetching updates…"
+  git -C magic fetch --all --tags --prune
+else
+  log "Cloning magic repo…"
+  git clone "$MAGIC_REPO" magic
 fi
 
 cd magic
+# Try branch/tag; fall back gracefully if not present.
+if git rev-parse --verify --quiet "$MAGIC_BRANCH" >/dev/null; then
+  git checkout "$MAGIC_BRANCH"
+else
+  warn "Branch/tag '$MAGIC_BRANCH' not found; staying on current."
+fi
+git submodule update --init --recursive
 
-# Clean previous attempts (if any)
-make distclean >/dev/null 2>&1 || true
-git reset --hard >/dev/null 2>&1 || true
+### ---------- Autoconf (if needed) ----------
+if [[ ! -x ./configure ]]; then
+  log "Generating configure (autogen)…"
+  ./configure || true # some trees generate on failure path
+fi
 
-# --- Configure for Aqua Tk (no X11) ---
-./configure \
-  --prefix="${PREFIX}" \
-  --with-tcl="${TCLTK_PREFIX}/lib" \
-  --with-tk="${TCLTK_PREFIX}/lib" \
-  --with-x=no \
-  --enable-cairo
+if [[ ! -x ./configure ]]; then
+  log "Running 'autoreconf -fi' to generate configure…"
+  autoreconf -fi
+fi
 
-# --- Build & Install ---
-make -j"$(sysctl -n hw.ncpu)"
+[[ -x ./configure ]] || die "configure script not found after autoreconf."
+
+### ---------- Configure ----------
+# Key bits:
+#  - --with-x=no    => use Aqua (Cocoa) Tk; avoids X11 colormap crashes (your segfaults).
+#  - --with-tcl/--with-tk: point to Brew Tcl/Tk libs
+#  - --with-tclsh/--with-wish: make sure it binds to the Aqua binaries
+#
+CONFIG_ARGS=(
+  "--prefix=$PREFIX"
+  "--with-x=no"
+  "--with-tcl=$TCL_PREFIX/lib"
+  "--with-tk=$TCL_PREFIX/lib"
+  "--with-tclsh=$TCLSH"
+  "--with-wish=$WISH"
+)
+
+log "Configuring Magic with: ${CONFIG_ARGS[*]}"
+./configure "${CONFIG_ARGS[@]}"
+
+### ---------- Build & Install ----------
+log "Building (make -j$JOBS)…"
+make -j"$JOBS"
+
+log "Installing to $PREFIX…"
 make install
 
-# --- Post-install message ---
-echo
-echo "✅ Installed Magic (Aqua) to: ${PREFIX}"
-echo "Add to PATH (and prefer Aqua Tcl/Tk) by adding these lines to your ~/.zshrc:"
-echo "  export PATH=\"${PREFIX}/bin:${TCLTK_PREFIX}/bin:\$PATH\""
-echo "  export PKG_CONFIG_PATH=\"${TCLTK_PREFIX}/lib/pkgconfig:\$PKG_CONFIG_PATH\""
-echo
-echo "Run now (without editing ~/.zshrc) with:"
-echo "  ${PREFIX}/bin/magic"
+### ---------- Smoke tests ----------
+MAGIC_BIN="$PREFIX/bin/magic"
+[[ -x "$MAGIC_BIN" ]] || die "Magic binary not found at $MAGIC_BIN"
+
+log "Headless sanity check…"
+# Use the built magic directly (ensures rpaths/paths are good).
+"$MAGIC_BIN" -dnull -noconsole -nowindow -rcfile /dev/null -T minimum <<<'quit' >/dev/null 2>&1 \
+  && log "[OK] magic headless" \
+  || die "Headless check failed."
+
+cat <<'EOF'
+
+--------------------------------------------
+Magic (Aqua) installed successfully 🎉
+--------------------------------------------
+
+To use it in your shell sessions, add to your shell rc (e.g., ~/.zshrc):
+
+  export PATH="$HOME/eda/bin:$PATH"
+
+(If you used a custom PREFIX, substitute it.)
+
+Launch the GUI:
+
+  magic
+
+If 'magic' still segfaults, it usually means something forced it back onto X11.
+This build is linked to Aqua Tk, so ensure you are NOT setting DISPLAY or X11 vars.
+You can verify the binary path with:
+
+  which magic
+  otool -L "$(which magic)" | grep -E 'tcl|tk'
+
+You should see it pulling from Homebrew’s tcl-tk keg (…/opt/tcl-tk).
+
+EOF
