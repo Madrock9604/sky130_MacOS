@@ -1,92 +1,143 @@
 #!/usr/bin/env bash
-# scripts/99_magic_gui_probe.sh
-# Probe Magic headless first, then try GUI drivers with a tiny Tcl script.
-set -euo pipefail
+# scripts/20_magic_brew.sh
+# Install Magic via Homebrew (GUI with XQuartz), create a small env,
+# and run headless + GUI smoke checks.
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-LOGDIR="${HOME}/sky130-diag"
-LOG="${LOGDIR}/magic_gui_attempt.log"
-mkdir -p "$LOGDIR"
+# ---------- Config ----------
+PREFIX="${PREFIX:-"$HOME/.eda/sky130"}"
+BIN_DIR="$PREFIX/bin"
+ACTIVATE="$PREFIX/activate"
+LOG_DIR="$HOME/sky130-diag"
+LOG="$LOG_DIR/magic_install.log"
+
+# ---------- Helpers ----------
+say(){ printf '%s\n' "$*"; }
+info(){ say "[INFO] $*"; }
+ok(){ say "✅ $*"; }
+warn(){ say "⚠️  $*"; }
+err(){ say "❌ $*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || return 1; }
+
+mkdir -p "$BIN_DIR" "$LOG_DIR"
 : >"$LOG"
 
-say(){ printf '%s\n' "$*" | tee -a "$LOG"; }
+info "Using PREFIX: $PREFIX"
+info "Logs: $LOG"
 
-# 0) Try to import your environment if present (but don't require it)
-ACT="${HOME}/.eda/sky130/activate"
-if [ -f "$ACT" ]; then
-  # shellcheck disable=SC1090
-  . "$ACT" || true
-fi
-
-# 1) Find magic
-MAGIC_BIN="${MAGIC_BIN:-$(command -v magic || true)}"
-if [ -z "${MAGIC_BIN}" ]; then
-  for c in /opt/local/bin/magic /opt/homebrew/bin/magic /usr/local/bin/magic; do
-    [ -x "$c" ] && MAGIC_BIN="$c" && break
-  done
-fi
-if [ -z "${MAGIC_BIN:-}" ]; then
-  say "❌ Could not find 'magic' in PATH. Install it (brew or MacPorts) and re-run."
+# ---------- 1) Homebrew presence ----------
+if ! need brew; then
+  err "Homebrew not found. Install it first:"
+  say '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
   exit 1
 fi
-say "[INFO] Using magic: ${MAGIC_BIN}"
-"$MAGIC_BIN" -v || "$MAGIC_BIN" -version || true | tee -a "$LOG"
+ok "Homebrew is available."
 
-# 2) Headless sanity check using a tiny Tcl file
-SMOKE="${LOGDIR}/smoke.tcl"
+# ---------- 2) Install deps via brew ----------
+info "Installing XQuartz (X11 server)…"
+brew list --cask xquartz >/dev/null 2>&1 || brew install --cask xquartz | tee -a "$LOG"
+ok "XQuartz installed (or already present)."
+
+info "Installing Magic…"
+brew list magic >/dev/null 2>&1 || brew install magic | tee -a "$LOG"
+ok "Magic installed (or already present)."
+
+# ---------- 3) Resolve magic binary ----------
+MAGIC_BIN="$(command -v magic || true)"
+if [[ -z "${MAGIC_BIN}" ]]; then
+  # Try the canonical Homebrew path
+  HB_BIN="$(brew --prefix)/bin/magic"
+  if [[ -x "$HB_BIN" ]]; then
+    MAGIC_BIN="$HB_BIN"
+  fi
+fi
+
+if [[ -z "${MAGIC_BIN}" ]]; then
+  err "Could not find a magic binary after install. Check Homebrew logs."
+  exit 1
+fi
+
+info "Using magic binary: $MAGIC_BIN"
+
+# ---------- 4) Create wrapper + env ----------
+# wrapper (execs the brew magic to avoid PATH surprises)
+WRAP="$BIN_DIR/magic"
+cat >"$WRAP" <<EOF
+#!/usr/bin/env bash
+exec "$MAGIC_BIN" "\$@"
+EOF
+chmod +x "$WRAP"
+ok "Wrapper created: $WRAP"
+
+# simple activate file
+cat >"$ACTIVATE" <<'EOF'
+# ~/.eda/sky130/activate
+# minimal environment for Sky130 tools
+export PATH="$HOME/.eda/sky130/bin:$PATH"
+# Prefer letting XQuartz set DISPLAY; uncomment only if needed:
+# export DISPLAY=:0
+EOF
+
+ok "Activate file written: $ACTIVATE"
+say 'To use:  source "$HOME/.eda/sky130/activate"'
+
+# ---------- 5) Headless sanity (no GUI) ----------
+info "Headless sanity check…"
+SMOKE="$(mktemp /tmp/magic_smoke.XXXXXX.tcl)"
 cat >"$SMOKE" <<'EOF'
-puts "OK [tech name]"
+# tiny Tcl: print tech name then quit
+puts "tech=[tech name]"
 quit -noprompt
 EOF
 
-say "[INFO] Headless sanity check…"
-if ! "$MAGIC_BIN" -dnull -noconsole "$SMOKE" >>"$LOG" 2>&1; then
-  say "❌ Headless tech load failed; see $LOG"
-  exit 1
+if ! "$WRAP" -dnull -noconsole -rcfile /dev/null "$SMOKE" >>"$LOG" 2>&1; then
+  warn "Headless check failed. See $LOG"
+else
+  ok "Headless OK (see $LOG)."
 fi
-say "✅ Headless OK."
+rm -f "$SMOKE"
 
-# 3) Ensure XQuartz is up & DISPLAY set (best effort; no failure if missing)
-if ! pgrep -x XQuartz >/dev/null 2>&1; then
-  say "[INFO] Starting XQuartz…"
-  open -a XQuartz || true
-  sleep 1
-fi
-if [ -z "${DISPLAY:-}" ]; then
-  export DISPLAY=":0"
-  say "[INFO] DISPLAY not set; using ${DISPLAY}"
-fi
-# Allow local client (ignore errors if xhost not present yet)
+# ---------- 6) Start XQuartz & GUI smoke ----------
+info "Starting/refreshing XQuartz…"
+# launch (idempotent); give it a moment
+open -ga XQuartz || true
+sleep 1
+# allow local client (if xhost exists)
 if command -v xhost >/dev/null 2>&1; then
-  /usr/X11/bin/xhost +localhost >/dev/null 2>&1 || true
+  xhost +localhost >/dev/null 2>&1 || true
 fi
 
-# 4) Try GUI drivers, each for ~1s, then quit
-GUI_TCL="${LOGDIR}/gui_probe.tcl"
+GUI_TCL="$(mktemp /tmp/magic_gui.XXXXXX.tcl)"
 cat >"$GUI_TCL" <<'EOF'
-# open a tiny delay to ensure window creation, then exit
-after 1000 { quit -noprompt }
+# open default layout window and quit shortly after
+after 600 { quit -noprompt }
 EOF
 
-drivers=(X11 CAIRO OGL XR)   # try in this order
-ok_driver=""
+# try drivers in order; stop at first success
+drivers=(X11 XR OGL)
+GUI_OK=0
 for d in "${drivers[@]}"; do
-  say "[INFO] Trying GUI driver: -d ${d} …"
-  if "$MAGIC_BIN" -d "$d" -noconsole -rcfile /dev/null "$GUI_TCL" >>"$LOG" 2>&1; then
-    ok_driver="$d"
-    say "✅ GUI driver works: ${d}"
+  info "Trying GUI driver: -d $d …"
+  if "$WRAP" -d "$d" -noconsole -rcfile /dev/null "$GUI_TCL" >>"$LOG" 2>&1; then
+    ok "GUI launched with driver: $d (quick-open test)."
+    GUI_OK=1
     break
   else
-    say "↩︎ ${d} failed; trying next…"
+    warn "$d failed; trying next…"
   fi
 done
+rm -f "$GUI_TCL"
 
-if [ -z "$ok_driver" ]; then
-  say "❌ All GUI drivers failed. See log: $LOG"
-  exit 2
+if [[ $GUI_OK -eq 0 ]]; then
+  warn "All GUI drivers failed to quick-open. See log: $LOG"
+  say "You can still try manually:  magic -d X11   (or XR / OGL)"
+else
+  ok "Magic GUI smoke test passed."
 fi
 
-say ""
-say "🎉 Success. Launch Magic GUI with:"
-say "    ${MAGIC_BIN} -d ${ok_driver}"
-say ""
-say "(Full log: $LOG)"
+say
+ok "Done. Next steps:"
+say '  1) source "$HOME/.eda/sky130/activate"'
+say '  2) run: magic -d X11      # or: -d XR, -d OGL'
+say "Log: $LOG"
