@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Build & install Magic (Tk 8.6 / Aqua + Cairo; NO OpenGL/3D) into ~/.eda/sky130_dev
+# Build & install Magic into ~/.eda/sky130_dev on macOS
+# - Tcl/Tk 8.6 (Homebrew tcl-tk@8)
+# - XQuartz (X11 headers/libs) present
+# - Cairo enabled
+# - OpenGL/3D disabled and stripped from Makefiles
+# - No -Werror so warnings don't fail the build
 set -euo pipefail
 
 EDA_PREFIX="${EDA_PREFIX:-$HOME/.eda/sky130_dev}"
@@ -7,6 +12,7 @@ SRC_DIR="${SRC_DIR:-$HOME/.eda/src}"
 LOGDIR="${LOGDIR:-$HOME/sky130-diag}"
 LOG="$LOGDIR/magic_install.log"
 MAGIC_REPO="${MAGIC_REPO:-https://github.com/RTimothyEdwards/magic.git}"
+X11_PREFIX="${X11_PREFIX:-/opt/X11}"
 
 mkdir -p "$LOGDIR" "$EDA_PREFIX/bin" "$SRC_DIR"
 exec > >(tee -a "$LOG") 2>&1
@@ -15,7 +21,7 @@ die(){ echo "❌ $*" >&2; exit 1; }
 ok(){ echo "✅ $*"; }
 info(){ echo "[INFO] $*"; }
 
-echo "Magic installer (Tk 8.6 / Aqua, Cairo, NO OpenGL/3D)"
+echo "Magic installer (Tk 8.6, X11 headers via XQuartz, Cairo, NO OpenGL/3D)"
 
 # 0) Ensure Homebrew in THIS shell
 if ! command -v brew >/dev/null 2>&1; then
@@ -27,6 +33,14 @@ command -v brew >/dev/null || die "Homebrew not found. Run scripts/00_prereqs_ma
 # 1) Ensure deps
 brew list --versions git   >/dev/null 2>&1 || brew install git
 brew list --versions cairo >/dev/null 2>&1 || brew install cairo
+# XQuartz provides X11 headers/libs at /opt/X11
+if ! [ -d "$X11_PREFIX/include/X11" ]; then
+  info "Installing XQuartz (provides X11 headers/libs)…"
+  brew install --cask xquartz
+  # Give launchd a moment to place files
+  sleep 2
+fi
+[ -d "$X11_PREFIX/include/X11" ] || die "X11 headers not found at $X11_PREFIX/include/X11"
 
 # 2) Locate Tk 8.6 (from prereqs) and verify wish8.6
 TK86_PREFIX="$(brew --prefix tcl-tk@8 2>/dev/null || true)"
@@ -34,15 +48,15 @@ TK86_PREFIX="$(brew --prefix tcl-tk@8 2>/dev/null || true)"
 TK_VER="$("$TK86_PREFIX/bin/wish8.6" <<< 'puts [info patchlevel]; exit' 2>/dev/null || true)"
 [[ "$TK_VER" == 8.6.* ]] || die "wish8.6 reports $TK_VER (need 8.6.x)."
 
-# 3) Build flags (keg-only Tk + Cairo) and **force no OpenGL/3D**
-EXTRA_INCLUDES="-I. -I.. -I../database -I../utils -I../tiles -I../hash -I../textio -I../commands -I../dbwind"
+# 3) Build flags (keg-only Tk + Cairo + X11 includes/libs) and force NO OpenGL/3D
+BASE_INC="-I. -I.. -I../database"
 export PKG_CONFIG_PATH="$TK86_PREFIX/lib/pkgconfig:$(brew --prefix cairo)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export CPPFLAGS="$EXTRA_INCLUDES -I$TK86_PREFIX/include -I$(brew --prefix cairo)/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$TK86_PREFIX/lib -L$(brew --prefix cairo)/lib ${LDFLAGS:-}"
-# Make clang tolerant of older C; DO NOT treat warnings as errors
+export CPPFLAGS="$BASE_INC -I$TK86_PREFIX/include -I$(brew --prefix cairo)/include -I$X11_PREFIX/include ${CPPFLAGS:-}"
+export LDFLAGS="-L$TK86_PREFIX/lib -L$(brew --prefix cairo)/lib -L$X11_PREFIX/lib ${LDFLAGS:-}"
+# Be tolerant of old C patterns; do not treat warnings as errors
 export CFLAGS="${CFLAGS:-} -std=gnu11 -Wno-error -Wno-deprecated-non-prototype -Wno-deprecated-declarations"
 
-# Tell configure/make that OpenGL does NOT exist (force-off)
+# Tell configure/make that OpenGL does NOT exist
 export ac_cv_header_GL_gl_h=no
 export ac_cv_header_OpenGL_gl_h=no
 export ac_cv_lib_GL_glFlush=no
@@ -63,34 +77,45 @@ fi
 cd "$SRC_DIR/magic"
 make distclean >/dev/null 2>&1 || true
 
-# 5) Configure: Aqua/Tk 8.6 + Cairo; **no OpenGL, no X11**
+# 5) Configure: Tk 8.6, Cairo ON, X11 headers available, OpenGL OFF
 info "./configure …"
 ./configure \
   --prefix="$EDA_PREFIX" \
-  --with-tcl="$TK86_PREFIX/lib" --with-tk="$TK86_PREFIX/lib" \
-  --with-tclincl="$TK86_PREFIX/include" --with-tkinc="$TK86_PREFIX/include" \
+  --with-tcl="$TK86_PREFIX/lib" \
+  --with-tk="$TK86_PREFIX/lib" \
+  --with-tclincl="$TK86_PREFIX/include" \
+  --with-tkinc="$TK86_PREFIX/include" \
   --with-cairo=yes \
   --with-opengl=no \
-  --with-x=no || die "configure failed."
+  --with-x="$X11_PREFIX" || die "configure failed."
 
-# 6) Belt-and-suspenders: strip 3D/OpenGL objs AND -Werror from ALL Makefiles
-info "Patching Makefiles (remove 3D/OpenGL objects and -Werror)…"
+# 6) Patch Makefiles: strip 3D/OpenGL objs & -Werror; ensure parent includes
+info "Patching Makefiles (remove 3D/OpenGL objects and -Werror; add parent includes)…"
 find . -name 'Makefile' -o -name 'Makefile.in' | while read -r mf; do
-  # drop any 3D/OpenGL objs
+  # Drop any 3D/OpenGL objs
   sed -E -i '' 's/[[:space:]]W3D[^[:space:]]*\.o//g' "$mf" || true
   sed -E -i '' 's/[[:space:]]TOGL[^[:space:]]*\.o//g' "$mf" || true
   sed -E -i '' 's/[[:space:]]grTOGL[^[:space:]]*\.o//g' "$mf" || true
-  # drop -Werror variants that turn warnings into errors
+  # Drop -Werror variants that turn warnings into build failures
   sed -E -i '' 's/[[:space:]]-Werror([=][^[:space:]]*)?//g' "$mf" || true
+  # Make sure common flags get parent includes for subdir builds
+  sed -E -i '' 's/^(CFLAGS[[:space:]]*=[[:space:]].*)$/\1 '"$BASE_INC"'/g' "$mf" || true
+  sed -E -i '' 's/^(CPPFLAGS[[:space:]]*=[[:space:]].*)$/\1 '"$BASE_INC"'/g' "$mf" || true
+  sed -E -i '' 's/^(CCOPTIONS[[:space:]]*=[[:space:]].*)$/\1 '"$BASE_INC"'/g' "$mf" || true
 done
 
-# 7) Build (serial) & install
+# Safety symlinks so subdirs can resolve "database/database.h" via CWD if needed
+for d in cmwind bplane; do
+  [ -d "$d" ] && ln -snf ../database "$d/database"
+done
+
+# 7) Build (serial while stabilizing) & install
 info "Building (serial)…"
 make -j1 || die "make failed."
 info "Installing…"
 make install || die "make install failed."
 
-# 8) Headless smoke test (no -eval)
+# 8) Headless smoke test
 SMOKE="$LOGDIR/magic-smoke.tcl"
 cat > "$SMOKE" <<'EOF'
 puts "Tcl: [info patchlevel]"
@@ -102,4 +127,4 @@ info "Smoke test…"
 "$EDA_PREFIX/bin/magic" -d null -noconsole -rcfile /dev/null -T scmos "$SMOKE" || die "Smoke test failed."
 
 ok "Magic built and installed at $EDA_PREFIX/bin/magic"
-echo "Open GUI (Aqua/Cairo):  magic -d XR -T scmos -rcfile /dev/null -wrapper"
+echo "Open GUI (X11/Cairo):  magic -d X11 -T scmos -rcfile /dev/null -wrapper"
