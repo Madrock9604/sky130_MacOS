@@ -1,89 +1,107 @@
 #!/usr/bin/env bash
-# Magic GUI smoke test with XQuartz diagnostics and driver fallbacks
-# Usage:
-#   bash scripts/25_magic_gui_test.sh
-#   MAGIC_DRIVER=XR bash scripts/25_magic_gui_test.sh   # force a specific driver
+# Build & install Magic using MacPorts Tk/Tcl 8.6 (X11), avoiding Homebrew Tk 9.0 crashes on XQuartz.
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---------- helpers ----------
-log(){ printf "%s %s\n" "[$(date +%H:%M:%S)]" "$*"; }
-have(){ command -v "$1" >/dev/null 2>&1; }
+# ===== Config =====
+EDA_ROOT="${EDA_ROOT:-$HOME/.eda/sky130}"
+SRC_DIR="${SRC_DIR:-$EDA_ROOT/src}"
+BIN_DIR="$EDA_ROOT/bin"
+MAGIC_REF="${MAGIC_REF:-master}"     # or pin a known-good tag/commit
+PORT_PREFIX="/opt/local"             # MacPorts prefix
+X11_PREFIX="/opt/X11"
 
-# ---------- env ----------
-: "${EDA_ROOT:=$HOME/.eda/sky130}"
-: "${MAGIC_BIN:=$EDA_ROOT/opt/magic/bin/magic}"
-: "${MAGIC_DRIVER:=auto}"     # auto | XR | X11 | cairo | Tk
-: "${XQUARTZ_APP:=XQuartz}"
-
-# ---------- sanity: magic present ----------
-if [ ! -x "$MAGIC_BIN" ]; then
-  echo "[ERR] Magic binary not found at $MAGIC_BIN"
-  echo "      Run: bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Madrock9604/sky130_MacOS/main/scripts/20_magic.sh)\""
-  exit 2
+# ===== Sanity: MacPorts present =====
+if ! command -v port >/dev/null 2>&1; then
+  echo "[ERR] MacPorts isn't installed. Run your prereqs script (00_prereqs_mac.sh) first." >&2
+  exit 1
 fi
 
-# ---------- XQuartz settings & launch ----------
-log "Ensuring XQuartz settings (Allow network clients, IGLX)…"
-defaults write org.xquartz.X11 nolisten_tcp -bool false || true
-defaults write org.xquartz.X11 enable_iglx -bool true || true
+# ===== Install Tk/Tcl 8.6 (X11) via MacPorts =====
+# These provide Tk/Tcl headers+libs under /opt/local, plus X11 bits.
+sudo port -N -q install tcl tk xorg-libX11 xorg-libXext xorg-libXi xorg-libXmu xorg-libXt cairo freetype fontconfig || {
+  echo "[ERR] MacPorts package installation failed"; exit 1;
+}
 
-log "Restarting XQuartz…"
-pkill -x "$XQUARTZ_APP" >/dev/null 2>&1 || true
-open -a "$XQUARTZ_APP"
-sleep 1
+# ===== Prepare source dirs =====
+mkdir -p "$SRC_DIR" "$BIN_DIR"
+cd "$SRC_DIR"
 
-# ---------- probe display ----------
-if have /opt/X11/bin/xdpyinfo; then
-  if ! /opt/X11/bin/xdpyinfo >/dev/null 2>&1; then
-    log "XQuartz display not ready yet; retrying once…"
-    sleep 1
-    /opt/X11/bin/xdpyinfo >/dev/null 2>&1 || {
-      echo "[ERR] XQuartz isn't accepting X11 clients yet."
-      echo "     Try fully quitting XQuartz (Cmd+Q) and rerun this script."
-      exit 3
-    }
-  fi
+# ===== Fetch Magic (or reuse) =====
+if [ ! -d magic ]; then
+  echo "[INFO] Cloning magic ($MAGIC_REF)…"
+  git clone --depth=1 --branch "$MAGIC_REF" https://github.com/RTimothyEdwards/magic.git
 fi
-log "XQuartz display looks OK."
+MAGIC_DIR="$SRC_DIR/magic"
+cd "$MAGIC_DIR"
 
-# ---------- choose driver(s) ----------
-DRIVERS=()
-case "$MAGIC_DRIVER" in
-  auto)  DRIVERS=(XR X11 cairo Tk) ;;
-  XR|X11|cairo|Tk) DRIVERS=("$MAGIC_DRIVER") ;;
-  *) echo "[ERR] Unknown MAGIC_DRIVER='$MAGIC_DRIVER'"; exit 4 ;;
-esac
+# ===== Toolchain: prefer MacPorts toolchain for Tk/Tcl/X11 =====
+export PATH="$PORT_PREFIX/bin:$PATH"
 
-# ---------- run headless quick check (confidence) ----------
-if ! echo 'quit' | "$MAGIC_BIN" -dnull -noconsole -rcfile /dev/null >/dev/null 2>&1; then
-  echo "[ERR] Magic headless check failed; GUI will likely fail too."
-  exit 5
+# ===== Build flags (nounset-safe) =====
+# Use MacPorts headers/libs first
+CPPBASE="-I$PORT_PREFIX/include -I$X11_PREFIX/include"
+CPPREL="-I. -I.. -I../.."
+export CPPFLAGS="$CPPBASE $CPPREL ${CPPFLAGS-}"
+export CFLAGS="$CPPBASE $CPPREL ${CFLAGS-}"
+export LDFLAGS="-L$PORT_PREFIX/lib -L$X11_PREFIX/lib ${LDFLAGS-}"
+
+# Prefer MacPorts’ pkg-config files
+if [ -n "${PKG_CONFIG_PATH-}" ]; then
+  export PKG_CONFIG_PATH="$PORT_PREFIX/lib/pkgconfig:$X11_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+else
+  export PKG_CONFIG_PATH="$PORT_PREFIX/lib/pkgconfig:$X11_PREFIX/lib/pkgconfig"
 fi
-log "Magic headless check passed."
 
-# ---------- try GUI drivers ----------
-for drv in "${DRIVERS[@]}"; do
-  log "Trying Magic with driver: -d $drv …"
-  if "$MAGIC_BIN" -d "$drv" >/dev/null 2>&1 & then
-    pid=$!
-    sleep 2
-    if ps -p "$pid" >/dev/null 2>&1; then
-      log "Magic GUI started with -d $drv (pid $pid)."
-      echo "Type ':quit' in the Magic console to exit."
-      exit 0
+# ===== Clean any previous build =====
+git reset --hard
+git clean -xfd
+
+# ===== Configure (single line: avoids backslash issues) =====
+# Point --with-tcl/--with-tk at MacPorts lib dir (contains tclConfig.sh / tkConfig.sh for 8.6)
+echo "[INFO] Configuring magic against MacPorts Tk/Tcl 8.6…"
+./configure --prefix="$EDA_ROOT/opt/magic" --with-tcl="$PORT_PREFIX/lib" --with-tk="$PORT_PREFIX/lib" --x-includes="$X11_PREFIX/include" --x-libraries="$X11_PREFIX/lib"
+
+# ===== Pre-generate auto header to avoid parallel build race =====
+if [ ! -f "database/database.h" ]; then
+  echo "[INFO] Pre-generating database/database.h …"
+  if ! make database/database.h; then
+    [ -x ./scripts/makedbh ] || chmod +x ./scripts/makedbh || true
+    if ! ./scripts/makedbh "database/database.h.in" "database/database.h"; then
+      if command -v /bin/csh >/dev/null 2>&1; then
+        /bin/csh ./scripts/makedbh "database/database.h.in" "database/database.h"
+      else
+        echo "[ERR] Could not run scripts/makedbh (csh not found)"; exit 1
+      fi
     fi
   fi
-  log "Driver -d $drv failed to launch cleanly; trying next…"
-done
+fi
+[ -f "database/database.h" ] || { echo "[ERR] Failed to generate database/database.h"; exit 1; }
 
-# ---------- all failed ----------
-echo "[ERR] Magic GUI failed with drivers: ${DRIVERS[*]}"
-echo "Tips:"
-echo "  • Reboot once after first installing XQuartz."
-echo "  • Run: conda deactivate    (Conda can interfere with Tk on macOS)"
-echo "  • Then rerun: MAGIC_DRIVER=Tk bash scripts/25_magic_gui_test.sh"
-echo "  • If still failing, paste the output of:"
-echo "      /opt/X11/bin/xdpyinfo | head -n5"
-echo "      otool -L \"$MAGIC_BIN\" | egrep 'X11|Tcl|Tk'"
-exit 6
+# ===== Build & install =====
+echo "[INFO] Building magic (Tk 8.6)…"
+make -j"$(/usr/sbin/sysctl -n hw.ncpu)"
+
+echo "[INFO] Installing to $EDA_ROOT/opt/magic …"
+make install
+
+# ===== Symlink into isolated bin =====
+mkdir -p "$BIN_DIR"
+ln -sf "$EDA_ROOT/opt/magic/bin/magic" "$BIN_DIR/magic"
+
+# ===== Headless smoke test =====
+if "$EDA_ROOT/opt/magic/bin/magic" -dnull -noconsole -rcfile /dev/null <<<'quit' >/dev/null 2>&1; then
+  echo "[OK ] Magic headless check passed (Tk 8.6 build)"
+else
+  echo "[WARN] Magic installed, but headless check failed."
+fi
+
+cat <<'EONOTE'
+[NOTE] Next:
+  1) Restart XQuartz once if this is your first time using it:
+        killall XQuartz 2>/dev/null || true
+        open -a XQuartz
+  2) Launch Magic:
+        magic -d XR &
+     If XR is sluggish, try: magic -d X11 &   or   magic -d cairo &
+EONOTE
