@@ -35,15 +35,14 @@ TK_VER="$("$TK86_PREFIX/bin/wish8.6" <<< 'puts [info patchlevel]; exit' 2>/dev/n
 [[ "$TK_VER" == 8.6.* ]] || die "wish8.6 reports $TK_VER (need 8.6.x)."
 
 # 3) Build flags (keg-only Tk + Cairo) and **force no OpenGL/3D**
-#    Add missing relative include paths so subdir builds (e.g., cmwind/) see ../database headers.
 EXTRA_INCLUDES="-I. -I.. -I../database -I../utils -I../tiles -I../hash -I../textio -I../commands -I../dbwind"
 export PKG_CONFIG_PATH="$TK86_PREFIX/lib/pkgconfig:$(brew --prefix cairo)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export CPPFLAGS="$EXTRA_INCLUDES -I$TK86_PREFIX/include -I$(brew --prefix cairo)/include ${CPPFLAGS:-}"
 export LDFLAGS="-L$TK86_PREFIX/lib -L$(brew --prefix cairo)/lib ${LDFLAGS:-}"
-# Make clang tolerant of older C patterns used by Magic sources.
-export CFLAGS="${CFLAGS:-} -std=gnu11 -Wno-error -Wno-deprecated-non-prototype"
+# Make clang tolerant of older C; DO NOT treat warnings as errors
+export CFLAGS="${CFLAGS:-} -std=gnu11 -Wno-error -Wno-deprecated-non-prototype -Wno-deprecated-declarations"
 
-# Tell configure/make to pretend OpenGL does not exist.
+# Tell configure/make that OpenGL does NOT exist (force-off)
 export ac_cv_header_GL_gl_h=no
 export ac_cv_header_OpenGL_gl_h=no
 export ac_cv_lib_GL_glFlush=no
@@ -74,16 +73,18 @@ info "./configure …"
   --with-opengl=no \
   --with-x=no || die "configure failed."
 
-# 6) Belt-and-suspenders: strip any W3D*/TOGL* objects from ALL Makefiles
-info "Patching Makefiles to remove 3D/OpenGL objects…"
-# macOS sed needs -i ''
+# 6) Belt-and-suspenders: strip 3D/OpenGL objs AND -Werror from ALL Makefiles
+info "Patching Makefiles (remove 3D/OpenGL objects and -Werror)…"
 find . -name 'Makefile' -o -name 'Makefile.in' | while read -r mf; do
+  # drop any 3D/OpenGL objs
   sed -E -i '' 's/[[:space:]]W3D[^[:space:]]*\.o//g' "$mf" || true
   sed -E -i '' 's/[[:space:]]TOGL[^[:space:]]*\.o//g' "$mf" || true
   sed -E -i '' 's/[[:space:]]grTOGL[^[:space:]]*\.o//g' "$mf" || true
+  # drop -Werror variants that turn warnings into errors
+  sed -E -i '' 's/[[:space:]]-Werror([=][^[:space:]]*)?//g' "$mf" || true
 done
 
-# 7) Build (serial to avoid edge-ordering issues while stabilizing) & install
+# 7) Build (serial) & install
 info "Building (serial)…"
 make -j1 || die "make failed."
 info "Installing…"
