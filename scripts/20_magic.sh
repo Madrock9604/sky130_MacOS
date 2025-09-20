@@ -1,108 +1,92 @@
 #!/usr/bin/env bash
+# scripts/99_magic_gui_probe.sh
+# Probe Magic headless first, then try GUI drivers with a tiny Tcl script.
 set -euo pipefail
 
-# ------------------------------------------------------------
-# Magic via Homebrew + XQuartz
-# Wires into ~/.eda/sky130/activate and ~/.eda/sky130/bin/magic
-# No upstream source repos used.
-# ------------------------------------------------------------
+LOGDIR="${HOME}/sky130-diag"
+LOG="${LOGDIR}/magic_gui_attempt.log"
+mkdir -p "$LOGDIR"
+: >"$LOG"
 
-# Allow overrides, but default to your env layout
-PREFIX="${PREFIX:-$HOME/.eda/sky130}"
-BIN_DIR="$PREFIX/bin"
-ACTIVATE="$HOME/.eda/sky130/activate"
+say(){ printf '%s\n' "$*" | tee -a "$LOG"; }
 
-echo "[INFO] Using PREFIX: $PREFIX"
-mkdir -p "$BIN_DIR"
-mkdir -p "$(dirname "$ACTIVATE")"
+# 0) Try to import your environment if present (but don't require it)
+ACT="${HOME}/.eda/sky130/activate"
+if [ -f "$ACT" ]; then
+  # shellcheck disable=SC1090
+  . "$ACT" || true
+fi
 
-# --- Require macOS + Homebrew ---
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "[ERR ] This script is intended for macOS." >&2
+# 1) Find magic
+MAGIC_BIN="${MAGIC_BIN:-$(command -v magic || true)}"
+if [ -z "${MAGIC_BIN}" ]; then
+  for c in /opt/local/bin/magic /opt/homebrew/bin/magic /usr/local/bin/magic; do
+    [ -x "$c" ] && MAGIC_BIN="$c" && break
+  done
+fi
+if [ -z "${MAGIC_BIN:-}" ]; then
+  say "❌ Could not find 'magic' in PATH. Install it (brew or MacPorts) and re-run."
   exit 1
 fi
+say "[INFO] Using magic: ${MAGIC_BIN}"
+"$MAGIC_BIN" -v || "$MAGIC_BIN" -version || true | tee -a "$LOG"
 
-if ! command -v brew >/dev/null 2>&1; then
-  echo "[ERR ] Homebrew is not installed."
-  echo "      Install it first, then re-run:"
-  echo '      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+# 2) Headless sanity check using a tiny Tcl file
+SMOKE="${LOGDIR}/smoke.tcl"
+cat >"$SMOKE" <<'EOF'
+puts "OK [tech name]"
+quit -noprompt
+EOF
+
+say "[INFO] Headless sanity check…"
+if ! "$MAGIC_BIN" -dnull -noconsole "$SMOKE" >>"$LOG" 2>&1; then
+  say "❌ Headless tech load failed; see $LOG"
   exit 1
 fi
+say "✅ Headless OK."
 
-# --- Install dependencies ---
-echo "[INFO] Updating Homebrew…"
-brew update
-
-echo "[INFO] Installing Magic (package: magic)…"
-brew install magic || true  # ok if already installed
-
-echo "[INFO] Installing XQuartz (X11 server)…"
-brew install --cask xquartz || true  # ok if already installed
-
-# --- Find Magic binary installed by Homebrew ---
-if command -v magic >/dev/null 2>&1; then
-  MAGIC_BIN="$(command -v magic)"
-else
-  # Fallback: look inside the keg
-  MAGIC_BIN="$(brew --prefix magic 2>/dev/null)/bin/magic"
+# 3) Ensure XQuartz is up & DISPLAY set (best effort; no failure if missing)
+if ! pgrep -x XQuartz >/dev/null 2>&1; then
+  say "[INFO] Starting XQuartz…"
+  open -a XQuartz || true
+  sleep 1
+fi
+if [ -z "${DISPLAY:-}" ]; then
+  export DISPLAY=":0"
+  say "[INFO] DISPLAY not set; using ${DISPLAY}"
+fi
+# Allow local client (ignore errors if xhost not present yet)
+if command -v xhost >/dev/null 2>&1; then
+  /usr/X11/bin/xhost +localhost >/dev/null 2>&1 || true
 fi
 
-if [[ ! -x "${MAGIC_BIN}" ]]; then
-  echo "[ERR ] Could not locate Magic binary after brew install." >&2
-  exit 1
-fi
-
-echo "[INFO] Using magic binary: ${MAGIC_BIN}"
-
-# --- Create a wrapper in your env bin (so your PATH wins) ---
-WRAPPER="$BIN_DIR/magic"
-cat > "$WRAPPER" <<EOF
-#!/usr/bin/env bash
-# Wrapper to run Homebrew Magic inside the sky130 environment.
-# Prefer XQuartz/X11 graphics; users can still pass -dnull for headless.
-
-# If XQuartz app is present but not running, optionally start it quietly.
-if [[ -d "/Applications/Utilities/XQuartz.app" ]] && ! pgrep -x XQuartz >/dev/null 2>&1; then
-  open -gj /Applications/Utilities/XQuartz.app 2>/dev/null || true
-fi
-
-exec "${MAGIC_BIN}" "\$@"
+# 4) Try GUI drivers, each for ~1s, then quit
+GUI_TCL="${LOGDIR}/gui_probe.tcl"
+cat >"$GUI_TCL" <<'EOF'
+# open a tiny delay to ensure window creation, then exit
+after 1000 { quit -noprompt }
 EOF
 
-chmod +x "$WRAPPER"
-echo "[INFO] Wrapper created at: $WRAPPER"
-
-# --- Write/patch the activate file so PATH includes your bin ---
-if [[ ! -f "$ACTIVATE" ]]; then
-  cat > "$ACTIVATE" <<'EOF'
-# sky130 environment activation
-# Adds ~/.eda/sky130/bin to PATH so repo-installed tools are found first.
-
-# Avoid duplicate PATH entries
-case ":$PATH:" in
-  *":$HOME/.eda/sky130/bin:"*) ;;
-  *) export PATH="$HOME/.eda/sky130/bin:$PATH" ;;
-esac
-EOF
-  echo "[INFO] Wrote env file: $ACTIVATE"
-else
-  # Ensure BIN_DIR is on PATH in the existing activate file
-  if ! grep -q '\/\.eda\/sky130\/bin' "$ACTIVATE"; then
-    cat >> "$ACTIVATE" <<'EOF'
-
-# Ensure sky130 bin is on PATH
-case ":$PATH:" in
-  *":$HOME/.eda/sky130/bin:"*) ;;
-  *) export PATH="$HOME/.eda/sky130/bin:$PATH" ;;
-case
-EOF
-    echo "[INFO] Updated env file: $ACTIVATE"
+drivers=(X11 CAIRO OGL XR)   # try in this order
+ok_driver=""
+for d in "${drivers[@]}"; do
+  say "[INFO] Trying GUI driver: -d ${d} …"
+  if "$MAGIC_BIN" -d "$d" -noconsole -rcfile /dev/null "$GUI_TCL" >>"$LOG" 2>&1; then
+    ok_driver="$d"
+    say "✅ GUI driver works: ${d}"
+    break
+  else
+    say "↩︎ ${d} failed; trying next…"
   fi
+done
+
+if [ -z "$ok_driver" ]; then
+  say "❌ All GUI drivers failed. See log: $LOG"
+  exit 2
 fi
 
-echo "[INFO] Done."
-echo "[INFO] Next steps:"
-echo "  1) source \"$ACTIVATE\""
-echo "  2) Run GUI test: magic"
-echo "     (If a window doesn't appear, open XQuartz first: open -a XQuartz)"
-echo "  3) Headless test (no GUI): magic -dnull -noconsole -nowindow -norcfile -T minimum - <<<'quit'"
+say ""
+say "🎉 Success. Launch Magic GUI with:"
+say "    ${MAGIC_BIN} -d ${ok_driver}"
+say ""
+say "(Full log: $LOG)"
