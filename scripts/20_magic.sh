@@ -2,10 +2,13 @@
 # -----------------------------------------------------------------------------
 # scripts/20_magic.sh — Install Magic via MacPorts (stable Tk-X11 build) on macOS
 # - Installs XQuartz (X11), MacPorts (if missing), then `port install magic`
-# - Creates ~/.eda/sky130_dev/bin/magic wrapper
-# - Smoke-tests headless; prints how to launch GUI
+# - Auto-fixes python313 IDLE.app activation conflicts (common on macOS)
+# - Creates ~/.eda/sky130_dev/bin/magic wrapper that exports TCL/TK library paths
+# - Smoke-tests headless (no DISPLAY/Tk load), prints how to launch GUI
 #
 # Logs: ~/sky130-diag/magic_install.log
+# Usage:
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Madrock9604/sky130_MacOS/refs/heads/main/scripts/20_magic.sh)"
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -24,7 +27,7 @@ die(){  echo "❌ $*" >&2; exit 1; }
 
 echo "Magic installer (MacPorts build: Tk-X11 + cairo)"
 
-# 0) Ensure Homebrew in THIS shell (for XQuartz cask)
+# 0) Ensure Homebrew is visible in THIS shell (used for XQuartz cask)
 if ! command -v brew >/dev/null 2>&1; then
   [ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)" || true
   [ -x /usr/local/bin/brew ]    && eval "$(/usr/local/bin/brew shellenv)"    || true
@@ -39,7 +42,7 @@ if ! [ -d "$X11_PREFIX/include/X11" ]; then
 fi
 [ -d "$X11_PREFIX/include/X11" ] || die "XQuartz not found at $X11_PREFIX (install failed)."
 
-# 2) Install MacPorts (pkg) if missing (Sequoia)
+# 2) Install MacPorts (pkg) if missing (macOS 15 / Sequoia)
 if ! command -v port >/dev/null 2>&1; then
   info "Installing MacPorts…"
   PKG_URL="https://github.com/macports/macports-base/releases/download/v2.11.5/MacPorts-2.11.5-15-Sequoia.pkg"
@@ -51,42 +54,43 @@ fi
 command -v port >/dev/null 2>&1 || die "MacPorts not on PATH after install."
 export PATH="$MP_PREFIX/bin:$MP_PREFIX/sbin:$PATH"
 
-# Handle python313 IDLE.app collision (common on macOS)
+# 3) Update ports tree
+info "Updating MacPorts…"
+sudo port -N selfupdate
+
+# 4) Preempt Python 3.13 IDLE.app collision (common activation error)
 if ! port -q installed python313 >/dev/null 2>&1; then
   sudo port -N install python313 || true
 fi
 if ! sudo port -f activate python313 >/dev/null 2>&1; then
   APP_DIR="/Applications/MacPorts/Python 3.13/IDLE.app"
   if [ -d "$APP_DIR" ]; then
-    echo "[INFO] Moving stray $APP_DIR out of the way…"
+    info "Moving stray $APP_DIR out of the way…"
     sudo mv "$APP_DIR" "${APP_DIR}.bak.$(date +%s)" || true
   fi
   sudo port -f activate python313 || true
 fi
 
-
-
-# 3) Update ports tree and install magic (pulls tk-x11, cairo, Xorg libs)
-info "Updating MacPorts…"
-sudo port -N selfupdate
+# 5) Install magic (pulls tk-x11, cairo, Xorg libs)
 info "Installing magic (tk-x11 backend)…"
 sudo port -N install magic
 
-# 4) Wrapper in ~/.eda/sky130_dev/bin so users call the right Magic
+# 6) Wrapper in ~/.eda/sky130_dev/bin so repo users call the right Magic + Tk libs
 WRAP="$EDA_PREFIX/bin/magic"
 cat > "$WRAP" <<'EOF'
 #!/usr/bin/env bash
+# Ensure MacPorts Tcl/Tk script libraries are found (fixes "tk.tcl not found")
+export TCL_LIBRARY=/opt/local/lib/tcl8.6
+export TK_LIBRARY=/opt/local/lib/tk8.6
 exec /opt/local/bin/magic "$@"
 EOF
 chmod +x "$WRAP"
 ok "Wrapper created: $WRAP"
 
-# 5) Headless smoke test
+# 7) Headless smoke test (no Tk load -> no DISPLAY needed)
 SMOKE="$LOGDIR/magic-smoke.tcl"
 cat > "$SMOKE" <<'EOF'
 puts "Magic: [magic::version]"
-puts "Tcl: [info patchlevel]"
-if {[catch {package require Tk} msg]} { puts "Tk: (not loaded) $msg" } else { puts "Tk: [tk patchlevel]" }
 quit -noprompt
 EOF
 
@@ -94,11 +98,15 @@ info "Smoke test…"
 "$WRAP" -d null -noconsole -rcfile /dev/null -T scmos "$SMOKE" || die "Smoke test failed."
 
 ok "Magic installed and working."
+
 echo
 echo "Launch the GUI (X11):"
+echo "  open -a XQuartz"
+echo "  /opt/X11/bin/xhost +localhost  >/dev/null 2>&1 || true"
+echo "  export DISPLAY=:0"
 echo "  magic -d X11 -T scmos -rcfile /dev/null -wrapper"
 echo
-echo "If XQuartz didn’t auto-start the first time, run:"
-echo "  open -a XQuartz && xhost +localhost"
+echo "If :0 doesn't work on your Mac, run:"
+echo '  export DISPLAY="$(ls -1d /private/tmp/com.apple.launchd.* 2>/dev/null | head -n1)/org.xquartz:0"'
 echo
 echo "Log: $LOG"
