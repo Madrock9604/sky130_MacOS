@@ -1,174 +1,118 @@
 #!/usr/bin/env bash
-# scripts/20_magic_source.sh
-# Build & install Magic from the official repo into ~/.eda/sky130
-# Requires Homebrew (for XQuartz, tcl-tk, cairo). GUI via XQuartz.
-set -Eeuo pipefail
-IFS=$'\n\t'
+# Install Magic from source (arm64/macOS) without touching existing setups
+# Usage: bash scripts/20_magic.sh
 
-# ---- Config ----
-PREFIX="${PREFIX:-"$HOME/.eda/sky130"}"
-OPT_DIR="$PREFIX/opt/magic"
-BIN_DIR="$PREFIX/bin"
-ACTIVATE="$PREFIX/activate"
-LOG_DIR="$HOME/sky130-diag"
-LOG="$LOG_DIR/magic_build.log"
-SRC_DIR="${SRC_DIR:-"$HOME/gits"}"
-MAGIC_GIT="${MAGIC_GIT:-"https://github.com/RTimothyEdwards/magic"}"
-MAGIC_TAG="${MAGIC_TAG:-"master"}"   # set a tag like "8.3.552" if you want
+set -euo pipefail
 
-say(){ printf '%s\n' "$*"; }
-info(){ say "[INFO] $*"; }
-ok(){ say "✅ $*"; }
-warn(){ say "⚠️  $*"; }
-err(){ say "❌ $*"; }
-need(){ command -v "$1" >/dev/null 2>&1; }
+# -------- Config (override via env) --------
+PREFIX="${PREFIX:-$HOME/.eda/sky130_dev}"        # <-- separate from any working/student install
+BREW_PREFIX="${BREW_PREFIX:-/opt/homebrew}"      # Intel Macs: /usr/local
+X11_PREFIX="${X11_PREFIX:-/opt/X11}"             # XQuartz default
+SRC_DIR="${SRC_DIR:-$HOME/src-eda}"
+LOG_DIR="${LOG_DIR:-$HOME/sky130-diag}"
+MAGIC_REPO="${MAGIC_REPO:-https://github.com/RTimothyEdwards/magic.git}"
+MAGIC_TAG="${MAGIC_TAG:-master}"                 # e.g., "8.3.495" if you want a fixed tag
+JOBS="${JOBS:-$(sysctl -n hw.ncpu)}"
 
-mkdir -p "$BIN_DIR" "$OPT_DIR" "$LOG_DIR" "$SRC_DIR"
-: >"$LOG"
+# -------- Internals --------
+mkdir -p "$SRC_DIR" "$LOG_DIR"
+LOG="$LOG_DIR/magic_install.log"
+STAMP_DIR="$PREFIX/.stamps"
+mkdir -p "$STAMP_DIR"
 
-info "Using PREFIX: $PREFIX"
-info "Logs: $LOG"
+exec > >(tee -a "$LOG") 2>&1
 
-# ---- 0) Homebrew present? ----
-if ! need brew; then
-  err "Homebrew not found. Install it first:"
-  say '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-  exit 1
-fi
-ok "Homebrew is available."
+bold(){ printf "\033[1m%s\033[0m\n" "$*"; }
+info(){ printf "[INFO] %s\n" "$*"; }
+ok(){ printf "✅ %s\n" "$*"; }
+fail(){ printf "❌ %s\n" "$*" >&2; exit 1; }
 
-# ---- 1) Deps via brew ----
-info "Installing build/runtime deps (XQuartz, tcl-tk, cairo, pkg-config, git)…"
-brew list --cask xquartz >/dev/null 2>&1 || brew install --cask xquartz | tee -a "$LOG"
-brew list tcl-tk    >/dev/null 2>&1 || brew install tcl-tk     | tee -a "$LOG"
-brew list cairo     >/dev/null 2>&1 || brew install cairo      | tee -a "$LOG"
-brew list pkg-config>/dev/null 2>&1 || brew install pkg-config | tee -a "$LOG"
-brew list git       >/dev/null 2>&1 || brew install git        | tee -a "$LOG"
-ok "Deps installed (or already present)."
+trap 'fail "Magic install failed at line $LINENO. See $LOG"' ERR
 
-HB_PREFIX="$(brew --prefix)"
-TCL_PREFIX="$(brew --prefix tcl-tk)"
-CAIRO_PREFIX="$(brew --prefix cairo)"
-X11_PREFIX="/opt/X11"
+bold "Magic installer"
+info "PREFIX=$PREFIX"
+info "BREW_PREFIX=$BREW_PREFIX"
+info "X11_PREFIX=$X11_PREFIX"
+info "SRC_DIR=$SRC_DIR"
+info "Log: $LOG"
 
-# ---- 2) Clone/Update Magic source ----
-cd "$SRC_DIR"
-if [[ -d magic/.git ]]; then
-  info "Updating existing magic repo…"
-  (cd magic && git fetch --all >>"$LOG" 2>&1 && git checkout "$MAGIC_TAG" >>"$LOG" 2>&1 && git pull >>"$LOG" 2>&1) || {
-    err "Failed to update magic repo. See $LOG"; exit 1; }
-else
-  info "Cloning magic from $MAGIC_GIT …"
-  git clone "$MAGIC_GIT" magic >>"$LOG" 2>&1 || { err "git clone failed"; exit 1; }
-  (cd magic && git checkout "$MAGIC_TAG" >>"$LOG" 2>&1) || true
-fi
+# -------- Preflight checks --------
+command -v git >/dev/null || fail "git not found"
+[ -x "$BREW_PREFIX/bin/brew" ] || fail "Homebrew not found at $BREW_PREFIX"
+[ -d "$X11_PREFIX/include" ] || fail "XQuartz headers not found at $X11_PREFIX (did 00_prereqs_mac.sh run?)"
 
-# ---- 3) Configure ----
-cd magic
-NPROC="$(
-  command -v sysctl >/dev/null && sysctl -n hw.ncpu 2>/dev/null ||
-  command -v getconf >/dev/null && getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4
-)"
-
-CONFIG_FLAGS=(
-  "--prefix=$OPT_DIR"
-  "--with-x"
-  "--x-includes=$X11_PREFIX/include"
-  "--x-libraries=$X11_PREFIX/lib"
-  "--with-tcl=$TCL_PREFIX/lib"
-  "--with-tk=$TCL_PREFIX/lib"
-  "--with-cairo=$CAIRO_PREFIX/include"
-  "--enable-cairo-offscreen"
-)
-
-info "Running ./configure …"
-echo "./configure ${CONFIG_FLAGS[*]}" >>"$LOG"
-if ! ./configure "${CONFIG_FLAGS[@]}" >>"$LOG" 2>&1; then
-  err "Configure failed. See $LOG"
-  exit 1
-fi
-ok "Configure OK."
-
-# ---- 4) Build & Install ----
-info "Building (make -j$NPROC)…"
-if ! make -j"$NPROC" >>"$LOG" 2>&1; then
-  err "Build failed. See $LOG"
-  exit 1
-fi
-ok "Build OK."
-
-info "Installing to $OPT_DIR …"
-if ! make install >>"$LOG" 2>&1; then
-  err "Install failed. See $LOG"
-  exit 1
-fi
-ok "Installed."
-
-# ---- 5) Wrapper and activate ----
-WRAP="$BIN_DIR/magic"
-cat >"$WRAP" <<EOF
-#!/usr/bin/env bash
-# exec the just-built magic
-exec "$OPT_DIR/bin/magic" "\$@"
-EOF
-chmod +x "$WRAP"
-ok "Wrapper: $WRAP"
-
-cat >"$ACTIVATE" <<'EOF'
-# ~/.eda/sky130/activate
-export PATH="$HOME/.eda/sky130/bin:$PATH"
-# Let XQuartz manage DISPLAY; uncomment only if you need to force it:
-# export DISPLAY=:0
-EOF
-ok "Activate: $ACTIVATE"
-
-# ---- 6) Headless sanity ----
-info "Headless sanity check…"
-SMOKE="$(mktemp /tmp/magic_smoke.XXXXXX.tcl)"
-cat >"$SMOKE" <<'EOF'
-puts "tech=[tech name]"
-quit -noprompt
-EOF
-if ! "$WRAP" -dnull -noconsole -rcfile /dev/null "$SMOKE" >>"$LOG" 2>&1; then
-  warn "Headless check failed; see $LOG"
-else
-  ok "Headless OK (details in $LOG)."
-fi
-rm -f "$SMOKE"
-
-# ---- 7) GUI quick smoke ----
-info "Starting/refreshing XQuartz…"
-open -ga XQuartz || true
-sleep 1
-command -v xhost >/dev/null 2>&1 && xhost +localhost >/dev/null 2>&1 || true
-
-GUI_TCL="$(mktemp /tmp/magic_gui.XXXXXX.tcl)"
-cat >"$GUI_TCL" <<'EOF'
-# open a layout window and quit shortly after
-after 600 { quit -noprompt }
-EOF
-
-drivers=(X11 XR OGL)
-GUI_OK=0
-for d in "${drivers[@]}"; do
-  info "Trying GUI driver: -d $d …"
-  if "$WRAP" -d "$d" -noconsole -rcfile /dev/null "$GUI_TCL" >>"$LOG" 2>&1; then
-    ok "GUI launched with: $d"
-    GUI_OK=1
-    break
-  else
-    warn "$d failed; trying next…"
+# Required deps (via Homebrew/XQuartz)
+need_pkgs=( tcl-tk cairo pkg-config )
+for pkg in "${need_pkgs[@]}"; do
+  if ! "$BREW_PREFIX/bin/brew" list --versions "$pkg" >/dev/null 2>&1; then
+    info "Installing $pkg…"
+    "$BREW_PREFIX/bin/brew" install "$pkg"
   fi
 done
-rm -f "$GUI_TCL"
+ok "Dependencies present"
 
-if [[ $GUI_OK -eq 0 ]]; then
-  warn "All GUI drivers failed to quick-open. See: $LOG"
-  say "You can still try manually after activating env: magic -d X11  (or XR/OGL)"
+# -------- Fetch source --------
+cd "$SRC_DIR"
+if [ ! -d magic ]; then
+  info "Cloning Magic…"
+  git clone "$MAGIC_REPO" magic
+else
+  info "Reusing existing magic src"
 fi
 
-say
-ok "Done. Next:"
-say '  1) source "$HOME/.eda/sky130/activate"'
-say '  2) run: magic -d X11   # or XR / OGL'
-say "Build log: $LOG"
+cd magic
+git fetch --all --tags
+git checkout "$MAGIC_TAG"
+git pull --ff-only || true
+
+# Clean previous builds if prefix changed
+[ -f Makefile ] && make distclean || true
+
+# -------- Configure --------
+CPPFLAGS="-I$BREW_PREFIX/include -I$X11_PREFIX/include"
+LDFLAGS="-L$BREW_PREFIX/lib -L$X11_PREFIX/lib"
+export CPPFLAGS LDFLAGS PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig"
+
+# Notes:
+# - We enable Cairo and disable OpenGL to avoid Mac OpenGL quirks on arm64.
+# - We explicitly point to Tcl/Tk from Homebrew.
+./configure \
+  --prefix="$PREFIX" \
+  --with-tcl="$BREW_PREFIX/opt/tcl-tk/lib" \
+  --with-tk="$BREW_PREFIX/opt/tcl-tk/lib" \
+  --with-x="$X11_PREFIX" \
+  --enable-cairo \
+  --disable-opengl
+
+ok "Configured Magic"
+
+# -------- Build & install --------
+# The database header is auto-generated; to avoid rare parallel hazards, do a safe build.
+info "Building Magic… (this can take a bit)"
+make -j1           # header generation & early steps safely
+make -j"$JOBS"
+
+info "Installing Magic to $PREFIX"
+make install
+
+# Convenience wrapper
+BIN="$PREFIX/bin/magic"
+if [ -x "$BIN" ]; then
+  ok "Magic installed: $BIN"
+  touch "$STAMP_DIR/magic.ok"
+else
+  fail "Magic binary not found after install"
+fi
+
+# PATH hint
+SHELL_RC="${SHELL_RC:-$HOME/.zshrc}"
+if ! grep -q "$PREFIX/bin" "$SHELL_RC" 2>/dev/null; then
+  info "Adding PATH hint to $SHELL_RC"
+  {
+    echo ""
+    echo "# Added by 20_magic.sh"
+    echo "export PATH=\"$PREFIX/bin:\$PATH\""
+  } >> "$SHELL_RC"
+fi
+
+ok "Magic done."
