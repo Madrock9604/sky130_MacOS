@@ -90,28 +90,27 @@ brew update >/dev/null
 # Install Homebrew’s Tk 8.x keg (this is 8.6); harmless if already installed
 brew list --versions tcl-tk@8 >/dev/null 2>&1 || brew install tcl-tk@8 || true
 
-find_tk86_prefix() {
-  # Different Homebrew layouts: tclConfig.sh may live in lib/ or lib/tcl8.6/
-  for cand in "$(brew --prefix tcl-tk@8 2>/dev/null)" "$(brew --prefix tcl-tk 2>/dev/null)"; do
-    [[ -n "$cand" ]] || continue
-    for cfg in "$cand/lib/tclConfig.sh" "$cand/lib/tcl8.6/tclConfig.sh"; do
-      if [[ -f "$cfg" ]] && grep -q 'TCL_VERSION=8\.6' "$cfg"; then
-        echo "$cand"; return 0
-      fi
-    done
-  done
-  return 1
-}
-
-TK86_PREFIX="$(find_tk86_prefix || true)"
-if [[ -z "$TK86_PREFIX" ]]; then
-  say "Reinstalling tcl-tk@8 to ensure 8.6 symbols…"
-  brew reinstall tcl-tk@8 || true
-  TK86_PREFIX="$(find_tk86_prefix || true)"
+# ---- Ensure/resolve Tcl/Tk 8.6 (install if missing), verify via wish8.6 ----
+TK86_PREFIX="$(brew --prefix tcl-tk@8 2>/dev/null || true)"
+if [ -z "$TK86_PREFIX" ] || [ ! -x "$TK86_PREFIX/bin/wish8.6" ]; then
+  echo "[INFO] Installing (or re-installing) tcl-tk@8…"
+  brew install tcl-tk@8 || brew reinstall tcl-tk@8 || true
+  TK86_PREFIX="$(brew --prefix tcl-tk@8 2>/dev/null || true)"
 fi
-[[ -n "$TK86_PREFIX" ]] || die "Tcl/Tk 8.6 keg not found after install. See $LOG"
-[[ -x "$TK86_PREFIX/bin/wish8.6" ]] || die "wish8.6 not found under $TK86_PREFIX"
-ok "Tk 8.6 at: $TK86_PREFIX"
+
+# Verify: ask wish8.6 for its version
+if [ -x "$TK86_PREFIX/bin/wish8.6" ]; then
+  TK_VER="$("$TK86_PREFIX/bin/wish8.6" <<< 'puts [info patchlevel]; exit' 2>/dev/null || true)"
+fi
+[ -n "${TK_VER:-}" ] && [[ "$TK_VER" == 8.6.* ]] || die "Tcl/Tk 8.6 not usable. (wish8.6 missing or wrong version). See $LOG"
+
+ok "Using Tk $TK_VER at: $TK86_PREFIX"
+
+# Ensure build tools can find this keg (keg-only)
+export PKG_CONFIG_PATH="$TK86_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export CPPFLAGS="-I$TK86_PREFIX/include ${CPPFLAGS:-}"
+export LDFLAGS="-L$TK86_PREFIX/lib ${LDFLAGS:-}"
+
 
 # ---------------- Fetch Magic source ----------------
 cd "$SRC_DIR"
