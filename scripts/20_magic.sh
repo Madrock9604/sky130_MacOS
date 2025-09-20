@@ -51,11 +51,10 @@ fi
 command -v port >/dev/null 2>&1 || die "MacPorts not on PATH after install."
 export PATH="$MP_PREFIX/bin:$MP_PREFIX/sbin:$PATH"
 
-# ---- Handle python313 activation image error (IDLE.app already exists)
+# Handle python313 IDLE.app collision (common on macOS)
 if ! port -q installed python313 >/dev/null 2>&1; then
   sudo port -N install python313 || true
 fi
-# Try a normal activate; if it fails due to Image error, move aside stray IDLE.app and force-activate
 if ! sudo port -f activate python313 >/dev/null 2>&1; then
   APP_DIR="/Applications/MacPorts/Python 3.13/IDLE.app"
   if [ -d "$APP_DIR" ]; then
@@ -64,6 +63,7 @@ if ! sudo port -f activate python313 >/dev/null 2>&1; then
   fi
   sudo port -f activate python313 || true
 fi
+
 
 
 # 3) Update ports tree and install magic (pulls tk-x11, cairo, Xorg libs)
