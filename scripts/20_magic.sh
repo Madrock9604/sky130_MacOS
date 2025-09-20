@@ -1,181 +1,228 @@
 #!/usr/bin/env bash
-#
 # build-magic-macos.sh
-# One-file macOS builder for Magic (Aqua/Cocoa GUI, no X11).
 #
-# - Requires: macOS + Homebrew
-# - Installs Homebrew deps if missing (tcl-tk, etc.)
-# - Configures Magic to use Brew Tcl/Tk and Aqua (no X11) to avoid colormap/X11 crashes.
-# - Installs under $PREFIX (default: $HOME/eda)
+# One-file builder for Magic VLSI on macOS (Apple Silicon & Intel).
+# - Uses Tcl/Tk **8.6** (required for Magic's build scripts).
+# - Disables X11 and builds against Aqua Tk (no DISPLAY, no X11 segfaults).
+# - Installs into:  $HOME/eda
 #
-# Usage:
-#   ./build-magic-macos.sh                # default build (prefix=$HOME/eda, branch=8.3)
-#   PREFIX=/opt/eda ./build-magic-macos.sh
-#   MAGIC_BRANCH=master ./build-magic-macos.sh
+# Optional:
+#   --prefix=/custom/prefix     Change install prefix (default: $HOME/eda)
+#   --tcltk-prefix=/path        Force a Tcl/Tk 8.6 prefix (bin/, lib/ inside)
+#   --bootstrap-tcl86           Build a private Tcl/Tk 8.6 into $HOME/opt/tcl86
+#   --no-clean                  Skip make distclean / git clean
+#
+# Example:
+#   chmod +x scripts/build-magic-macos.sh
+#   scripts/build-magic-macos.sh
 #
 set -euo pipefail
 
-### ---------- Config ----------
-: "${PREFIX:="$HOME/eda"}"
-: "${SRCROOT:="$HOME/src"}"
-: "${MAGIC_REPO:="https://github.com/RTimothyEdwards/magic.git"}"
-: "${MAGIC_BRANCH:="8.3"}"     # try "master" if you want bleeding edge
-: "${JOBS:="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"}"
+## ---------- tiny logger ----------
+log()   { printf "\033[1;34m[INFO]\033[0m %s\n" "$*"; }
+warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
+err()   { printf "\033[1;31m[ERR ]\033[0m %s\n" "$*" >&2; exit 1; }
 
-### ---------- Helpers ----------
-log() { printf '\n\033[1;32m[INFO]\033[0m %s\n' "$*"; }
-warn(){ printf '\n\033[1;33m[WARN]\033[0m %s\n' "$*"; }
-die() { printf '\n\033[1;31m[ERR]\033[0m %s\n' "$*"; exit 1; }
+## ---------- defaults & args ----------
+PREFIX="${HOME}/eda"
+TCLTK_PREFIX=""
+DO_CLEAN=1
+BOOTSTRAP=0
 
-### ---------- OS / Brew checks ----------
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  die "This script is macOS-only."
-fi
-
-if ! command -v brew >/dev/null 2>&1; then
-  die "Homebrew not found. Install from https://brew.sh and re-run."
-fi
-
-### ---------- Install deps ----------
-log "Ensuring required Homebrew packages are installed…"
-# tcl-tk provides wish/tclsh headers/libs (Aqua). Others are common build tools.
-brew list --versions tcl-tk >/dev/null 2>&1 || brew install tcl-tk
-brew list --versions pkg-config >/dev/null 2>&1 || brew install pkg-config
-brew list --versions autoconf  >/dev/null 2>&1 || brew install autoconf
-brew list --versions automake  >/dev/null 2>&1 || brew install automake
-brew list --versions libtool   >/dev/null 2>&1 || brew install libtool
-brew list --versions cairo     >/dev/null 2>&1 || brew install cairo
-brew list --versions git       >/dev/null 2>&1 || brew install git
-
-BREW_PREFIX="$(brew --prefix)"
-TCL_PREFIX="$(brew --prefix tcl-tk)"   # keg: …/opt/tcl-tk
-
-# Put brew Tcl/Tk tools first so we pick up Aqua wish/tclsh.
-export PATH="$TCL_PREFIX/bin:$PATH"
-
-# Headers/libs live in multiple dirs depending on Tcl/Tk version (8.6 vs 9.x).
-CPP_DIRS=()
-for d in "$TCL_PREFIX/include" "$TCL_PREFIX/include/tcl8.6" "$TCL_PREFIX/include/tcl8.7" "$TCL_PREFIX/include/tcl9.0"; do
-  [[ -d "$d" ]] && CPP_DIRS+=("-I$d")
-done
-LDPATHS=()
-for d in "$TCL_PREFIX/lib"; do
-  [[ -d "$d" ]] && LDPATHS+=("-L$d")
+for arg in "$@"; do
+  case "$arg" in
+    --prefix=*)          PREFIX="${arg#*=}";;
+    --tcltk-prefix=*)    TCLTK_PREFIX="${arg#*=}";;
+    --bootstrap-tcl86)   BOOTSTRAP=1;;
+    --no-clean)          DO_CLEAN=0;;
+    *) err "Unknown option: $arg";;
+  esac
 done
 
-# Cairo pkgconfig lives in brew prefix; Tcl’s .pc files live under the keg.
-export PKG_CONFIG_PATH="$TCL_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export CPPFLAGS="${CPPFLAGS:-} ${CPP_DIRS[*]}"
-export LDFLAGS="${LDFLAGS:-} ${LDPATHS[*]}"
+## ---------- sanity checks ----------
+[[ "$(uname -s)" == "Darwin" ]] || err "This script is for macOS."
+command -v gcc >/dev/null || command -v clang >/dev/null || err "Need gcc/clang in PATH."
 
-# Locate tclsh/wish from Brew keg
-TCLSH="$(command -v tclsh || true)"
-WISH="$(command -v wish || true)"
-[[ -x "$TCLSH" ]] || die "tclsh not found in PATH ($PATH)"
-[[ -x "$WISH"  ]] || die "wish not found in PATH ($PATH)"
+# Ensure we are at the root of the magic source tree (has ./configure and scripts/makedbh)
+[[ -f "./configure" && -f "./scripts/makedbh" && -f "./database/database.h.in" ]] \
+  || err "Run this from the Magic source root (must contain ./configure, ./scripts/makedbh, ./database/database.h.in)."
 
-log "Using Tcl/Tk from: $TCL_PREFIX"
+## ---------- helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+find_tcl86() {
+  # If user forced a prefix, prefer that
+  if [[ -n "$TCLTK_PREFIX" ]]; then
+    if [[ -x "$TCLTK_PREFIX/bin/tclsh8.6" ]] && [[ -x "$TCLTK_PREFIX/bin/wish8.6" ]]; then
+      echo "$TCLTK_PREFIX"
+      return 0
+    else
+      err "--tcltk-prefix does not contain tclsh8.6 & wish8.6: $TCLTK_PREFIX"
+    fi
+  fi
+
+  # MacPorts (recommended): /opt/local
+  if [[ -x /opt/local/bin/tclsh8.6 && -x /opt/local/bin/wish8.6 ]]; then
+    echo "/opt/local"
+    return 0
+  fi
+
+  # Homebrew versioned formula (if available)
+  if have brew; then
+    if brew --prefix tcl-tk@8.6 >/dev/null 2>&1; then
+      local p
+      p="$(brew --prefix tcl-tk@8.6)"
+      if [[ -x "$p/bin/tclsh8.6" && -x "$p/bin/wish8.6" ]]; then
+        echo "$p"
+        return 0
+      fi
+    fi
+    # Some brews drop version suffix but still ship 8.6
+    if brew --prefix tcl-tk >/dev/null 2>&1; then
+      local p
+      p="$(brew --prefix tcl-tk)"
+      if [[ -x "$p/bin/tclsh8.6" && -x "$p/bin/wish8.6" ]]; then
+        echo "$p"
+        return 0
+      fi
+    fi
+  fi
+
+  # Private build (common path this script can create)
+  if [[ -x "${HOME}/opt/tcl86/bin/tclsh8.6" && -x "${HOME}/opt/tcl86/bin/wish8.6" ]]; then
+    echo "${HOME}/opt/tcl86"
+    return 0
+  fi
+
+  return 1
+}
+
+bootstrap_tcl86() {
+  log "Bootstrapping private Tcl/Tk 8.6 into \$HOME/opt/tcl86 ..."
+  local work=/tmp/tcl86-build-$$
+  mkdir -p "$work" "$HOME/opt/tcl86"
+  pushd "$work" >/dev/null
+
+  # Versions pinned here; adjust if you like.
+  local TCL_VER=8.6.14
+  local TK_VER=8.6.14
+
+  curl -L -o "tcl${TCL_VER}-src.tar.gz" "https://downloads.sourceforge.net/tcl/tcl${TCL_VER}-src.tar.gz"
+  tar xf "tcl${TCL_VER}-src.tar.gz"
+  pushd "tcl${TCL_VER}/unix" >/dev/null
+    ./configure --prefix="${HOME}/opt/tcl86"
+    make -j"$(sysctl -n hw.ncpu)"
+    make install
+  popd >/dev/null
+
+  pushd "tcl${TCL_VER}/pkgs/itcl4.2.3/unix" >/dev/null || true
+    if [[ -f ./configure ]]; then
+      ./configure --prefix="${HOME}/opt/tcl86" --with-tcl="${HOME}/opt/tcl86/lib"
+      make -j"$(sysctl -n hw.ncpu)" && make install || true
+    fi
+  popd >/dev/null || true
+
+  curl -L -o "tk${TK_VER}-src.tar.gz" "https://downloads.sourceforge.net/tcl/tk${TK_VER}-src.tar.gz"
+  tar xf "tk${TK_VER}-src.tar.gz"
+  pushd "tk${TK_VER}/unix" >/dev/null
+    ./configure --prefix="${HOME}/opt/tcl86" --with-tcl="${HOME}/opt/tcl86/lib"
+    make -j"$(sysctl -n hw.ncpu)"
+    make install
+  popd >/dev/null
+
+  popd >/dev/null
+  log "Tcl/Tk 8.6 installed at: ${HOME}/opt/tcl86"
+}
+
+## ---------- choose Tcl/Tk 8.6 ----------
+if ! TCLTK_PREFIX="$(find_tcl86)"; then
+  if [[ "$BOOTSTRAP" -eq 1 ]]; then
+    bootstrap_tcl86
+    TCLTK_PREFIX="${HOME}/opt/tcl86"
+  else
+    cat <<'EOF' >&2
+Tcl/Tk 8.6 not found.
+
+Options:
+  1) Install via MacPorts:
+       sudo port install tcl tk +quartz
+     (then re-run this script)
+
+  2) Homebrew (if formula exists):
+       brew install tcl-tk@8.6
+     (then re-run this script with: --tcltk-prefix="$(brew --prefix tcl-tk@8.6)")
+
+  3) Let this script build it:
+       re-run with: --bootstrap-tcl86
+EOF
+    exit 1
+  fi
+fi
+
+TCLSH="${TCLTK_PREFIX}/bin/tclsh8.6"
+WISH="${TCLTK_PREFIX}/bin/wish8.6"
+TCLTK_LIB="${TCLTK_PREFIX}/lib"
+
+[[ -x "$TCLSH" ]] || err "Missing $TCLSH"
+[[ -x "$WISH"  ]] || err "Missing $WISH"
+
+log "Using Tcl/Tk 8.6 at: $TCLTK_PREFIX"
 log "tclsh: $TCLSH"
 log "wish : $WISH"
-log "CPPFLAGS: $CPPFLAGS"
-log "LDFLAGS : $LDFLAGS"
-log "PKG_CONFIG_PATH: ${PKG_CONFIG_PATH:-<empty>}"
 
-### ---------- Prepare dirs ----------
-mkdir -p "$SRCROOT" "$PREFIX"
-log "Source root: $SRCROOT"
-log "Install prefix: $PREFIX"
+## ---------- environment hygiene ----------
+# Force Aqua Tk; ensure no X11
+unset DISPLAY
+export PATH="${TCLTK_PREFIX}/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:${PATH:-}"
 
-### ---------- Fetch Magic ----------
-cd "$SRCROOT"
-if [[ -d magic/.git ]]; then
-  log "Found existing magic repo, fetching updates…"
-  git -C magic fetch --all --tags --prune
-else
-  log "Cloning magic repo…"
-  git clone "$MAGIC_REPO" magic
+## ---------- clean (optional but recommended) ----------
+if [[ "$DO_CLEAN" -eq 1 ]]; then
+  log "Cleaning tree…"
+  make distclean || true
+  if have git; then git clean -fdx || true; fi
 fi
 
-cd magic
-# Try branch/tag; fall back gracefully if not present.
-if git rev-parse --verify --quiet "$MAGIC_BRANCH" >/dev/null; then
-  git checkout "$MAGIC_BRANCH"
-else
-  warn "Branch/tag '$MAGIC_BRANCH' not found; staying on current."
-fi
-git submodule update --init --recursive
+## ---------- pre-generate header with Tcl 8.6 ----------
+log "Generating database/database.h with Tcl 8.6…"
+"$TCLSH" ./scripts/makedbh ./database/database.h.in ./database/database.h
+[[ -f ./database/database.h ]] || err "Failed to create database/database.h"
 
-### ---------- Autoconf (if needed) ----------
-if [[ ! -x ./configure ]]; then
-  log "Generating configure (autogen)…"
-  ./configure || true # some trees generate on failure path
-fi
+## ---------- configure ----------
+log "Configuring Magic (no X11, Tcl/Tk 8.6)…"
+./configure \
+  --prefix="${PREFIX}" \
+  --with-x=no \
+  --with-tcl="${TCLTK_LIB}" \
+  --with-tk="${TCLTK_LIB}" \
+  --with-tclsh="${TCLSH}" \
+  --with-wish="${WISH}"
 
-if [[ ! -x ./configure ]]; then
-  log "Running 'autoreconf -fi' to generate configure…"
-  autoreconf -fi
-fi
+## ---------- build & install ----------
+log "Building…"
+make -j"$(sysctl -n hw.ncpu)"
 
-[[ -x ./configure ]] || die "configure script not found after autoreconf."
-
-### ---------- Configure ----------
-# Key bits:
-#  - --with-x=no    => use Aqua (Cocoa) Tk; avoids X11 colormap crashes (your segfaults).
-#  - --with-tcl/--with-tk: point to Brew Tcl/Tk libs
-#  - --with-tclsh/--with-wish: make sure it binds to the Aqua binaries
-#
-CONFIG_ARGS=(
-  "--prefix=$PREFIX"
-  "--with-x=no"
-  "--with-tcl=$TCL_PREFIX/lib"
-  "--with-tk=$TCL_PREFIX/lib"
-  "--with-tclsh=$TCLSH"
-  "--with-wish=$WISH"
-)
-
-log "Configuring Magic with: ${CONFIG_ARGS[*]}"
-./configure "${CONFIG_ARGS[@]}"
-
-### ---------- Build & Install ----------
-log "Building (make -j$JOBS)…"
-make -j"$JOBS"
-
-log "Installing to $PREFIX…"
+log "Installing to ${PREFIX}…"
 make install
 
-### ---------- Smoke tests ----------
-MAGIC_BIN="$PREFIX/bin/magic"
-[[ -x "$MAGIC_BIN" ]] || die "Magic binary not found at $MAGIC_BIN"
+## ---------- sanity test ----------
+log "Smoke test (headless)…"
+"${PREFIX}/bin/magic" -dnull -noconsole -nowindow -rcfile /dev/null -T minimum <<<'quit' >/dev/null || {
+  warn "Headless test failed—Magic still installed. Try running ${PREFIX}/bin/magic manually for messages."
+}
 
-log "Headless sanity check…"
-# Use the built magic directly (ensures rpaths/paths are good).
-"$MAGIC_BIN" -dnull -noconsole -nowindow -rcfile /dev/null -T minimum <<<'quit' >/dev/null 2>&1 \
-  && log "[OK] magic headless" \
-  || die "Headless check failed."
+cat <<EOF
 
-cat <<'EOF'
+✅ Done.
 
---------------------------------------------
-Magic (Aqua) installed successfully 🎉
---------------------------------------------
+Installed binaries:
+  ${PREFIX}/bin/magic
+  ${PREFIX}/bin/ext2spice (and others)
 
-To use it in your shell sessions, add to your shell rc (e.g., ~/.zshrc):
+Notes:
+  • This build uses Aqua Tk (no X11). Don't set DISPLAY.
+  • If you also have MacPorts/XQuartz/Homebrew X11 libs around, that's fine—we forced --with-x=no.
 
-  export PATH="$HOME/eda/bin:$PATH"
-
-(If you used a custom PREFIX, substitute it.)
-
-Launch the GUI:
-
-  magic
-
-If 'magic' still segfaults, it usually means something forced it back onto X11.
-This build is linked to Aqua Tk, so ensure you are NOT setting DISPLAY or X11 vars.
-You can verify the binary path with:
-
-  which magic
-  otool -L "$(which magic)" | grep -E 'tcl|tk'
-
-You should see it pulling from Homebrew’s tcl-tk keg (…/opt/tcl-tk).
+Tips:
+  export PATH="${PREFIX}/bin:\$PATH"
 
 EOF
