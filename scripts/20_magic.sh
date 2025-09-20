@@ -1,170 +1,159 @@
 #!/usr/bin/env bash
-# Magic (8.3) builder for macOS (Apple Silicon & Intel)
-# - Installs under ~/.eda and updates ~/.eda/sky130/activate
-# - Prefers MacPorts (/opt/local), falls back to Homebrew (/opt/homebrew)
-# - Builds Tk/X11 GUI when XQuartz is present
-# - Only uses the official Magic repo
+#
+# 20_magic.sh — install Magic (VLSI) on macOS
+# - If MacPorts is present: uses `port install magic +x11`
+# - Else: uses Homebrew for deps and builds from source tag
+#
+# Config via env:
+#   PREFIX          install prefix (default: "$HOME/eda")
+#   MAGIC_VER       git tag to build when using source (default: "8.3.552")
+#   ACTIVATE_FILE   env file to source in wrapper (default: "$HOME/.eda/sky130/activate")
+#   MAKE_JOBS       parallelism for make (default: CPU count)
+#
+set -euo pipefail
 
-set -Eeuo pipefail
+# ------------- config -------------
+PREFIX="${PREFIX:-$HOME/eda}"
+MAGIC_VER="${MAGIC_VER:-8.3.552}"
+ACTIVATE_FILE="${ACTIVATE_FILE:-$HOME/.eda/sky130/activate}"
+MAKE_JOBS="${MAKE_JOBS:-$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
-# -------------------------
-# Configurable environment (all with safe defaults)
-# -------------------------
-EDA_HOME="${EDA_HOME:-$HOME/.eda}"                 # base EDA dir (env lives here)
-PREFIX="${PREFIX:-$EDA_HOME}"                      # install prefix
-ACTIVATE_FILE="${ACTIVATE_FILE:-$EDA_HOME/sky130/activate}"
-MAGIC_VER="${MAGIC_VER:-8.3.552}"                  # tag/branch in Magic repo
-MAGIC_REPO="${MAGIC_REPO:-https://github.com/RTimothyEdwards/magic.git}"
-ENABLE_OPENGL="${ENABLE_OPENGL:-no}"               # yes/no
-ENABLE_CAIRO="${ENABLE_CAIRO:-no}"                 # yes/no
+BIN_DIR="$PREFIX/bin"
+WRAPPER="$BIN_DIR/magic"
+LOG_PREFIX="[MAGIC]"
 
-# -------------------------
-# Toolchain detection
-# -------------------------
-if ! command -v git >/dev/null 2>&1; then
-  echo "[ERR ] 'git' not found. Install Xcode CLT:  xcode-select --install" >&2
-  exit 1
-fi
+say() { printf "%s %s\n" "$LOG_PREFIX" "$*"; }
+die() { printf "%s ERROR: %s\n" "$LOG_PREFIX" "$*" >&2; exit 1; }
 
-TCL_PREFIX=""
-TCLSH=""
-if command -v port >/dev/null 2>&1 && [ -d /opt/local ]; then
-  PKG_SYS="macports"
-  TCL_PREFIX="/opt/local"
-  TCL_BIN="$TCL_PREFIX/bin"
-  TCLSH="$TCL_BIN/tclsh8.6"
-elif command -v brew >/dev/null 2>&1; then
-  PKG_SYS="homebrew"
-  if brew --prefix tcl-tk >/dev/null 2>&1; then
-    TCL_PREFIX="$(brew --prefix tcl-tk)"
-  else
-    TCL_PREFIX="/opt/homebrew/opt/tcl-tk"
-  fi
-  TCL_BIN="$TCL_PREFIX/bin"
-  if [ -x "$TCL_BIN/tclsh8.6" ]; then
-    TCLSH="$TCL_BIN/tclsh8.6"
-  else
-    TCLSH="$TCL_BIN/tclsh"
-  fi
-else
-  echo "[ERR ] Neither MacPorts nor Homebrew found. Install one of them." >&2
-  exit 1
-fi
+have() { command -v "$1" >/dev/null 2>&1; }
 
-# XQuartz (X11) — optional but required for GUI
-if [ -d /opt/X11 ]; then
-  X11_PREFIX="/opt/X11"
-  HAVE_X11=1
-else
-  X11_PREFIX=""
-  HAVE_X11=0
-fi
-
-echo "[INFO] Using install PREFIX: $PREFIX"
-echo "[INFO] Package system: $PKG_SYS"
-echo "[INFO] TCL/TK prefix: $TCL_PREFIX"
-echo "[INFO] Detected TCLSH: ${TCLSH:-"(none)"}"
-if [ "$HAVE_X11" -eq 1 ]; then
-  echo "[INFO] X11 detected at $X11_PREFIX (XQuartz). Magic will build with GUI."
-else
-  echo "[WARN] X11 (XQuartz) not found. Magic will build, but only '-dnull' (no GUI) will work."
-fi
-
-if [ ! -x "${TCLSH:-/nonexistent}" ]; then
-  echo "[ERR ] tclsh not found/executable at $TCLSH" >&2
-  echo "       Install Tcl/Tk 8.6 (MacPorts: 'sudo port install tcl tk' | Homebrew: 'brew install tcl-tk')." >&2
-  exit 1
-fi
-
-# -------------------------
-# Prepare dirs
-# -------------------------
-mkdir -p "$PREFIX"/{bin,lib,include,src} "$EDA_HOME/sky130"
-BUILD_ROOT="$(mktemp -d -t magic-remote-build-XXXXXX)"
-SRC_DIR="$BUILD_ROOT/magic-src"
-
-cleanup() { [ -d "$BUILD_ROOT" ] && rm -rf "$BUILD_ROOT"; }
-trap cleanup EXIT
-
-# -------------------------
-# Fetch + configure
-# -------------------------
-echo "[INFO] Cloning Magic ${MAGIC_VER}…"
-git clone --depth 1 --branch "$MAGIC_VER" "$MAGIC_REPO" "$SRC_DIR" >/dev/null
-
-cd "$SRC_DIR"
-
-CFG=(
-  "--prefix=$PREFIX"
-  "--with-tcl=$TCL_PREFIX/lib"
-  "--with-tk=$TCL_PREFIX/lib"
-  "--with-tclinclude=$TCL_PREFIX/include"
-)
-
-if [ "$HAVE_X11" -eq 1 ]; then
-  CFG+=("--x-includes=$X11_PREFIX/include" "--x-libraries=$X11_PREFIX/lib")
-else
-  CFG+=("--with-x=no")
-fi
-
-if [ "${ENABLE_OPENGL}" = "yes" ]; then CFG+=("--with-opengl"); else CFG+=("--with-opengl=no"); fi
-if [ "${ENABLE_CAIRO}"  = "yes" ]; then CFG+=("--with-cairo");  else CFG+=("--with-cairo=no");  fi
-
-export CC="${CC:-clang}"
-export CFLAGS="${CFLAGS:-} -Wno-deprecated-non-prototype"
-
-echo "[INFO] Running ./configure ${CFG[*]} …"
-./configure "${CFG[@]}"
-
-echo
-echo "-----------------------------------------------------------"
-echo "Configuration Summary (key bits):"
-grep -E '^(X11|Python3|OpenGL|Cairo|Tcl/Tk):' config.log || true
-echo "-----------------------------------------------------------"
-echo
-
-# -------------------------
-# Build + install
-# -------------------------
-CORES="$(command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-
-echo "[INFO] Building (make -j$CORES)…"
-make -j"$CORES"
-
-echo "[INFO] Installing (make install)…"
-make install
-
-# -------------------------
-# Update environment file
-# -------------------------
-touch "$ACTIVATE_FILE"
-
-append_once() {
-  local line="$1"
-  local file="$2"
-  grep -qxF "$line" "$file" 2>/dev/null || echo "$line" >> "$file"
+ensure_dirs() {
+  mkdir -p "$BIN_DIR"
 }
 
-append_once '# magic (auto-added)' "$ACTIVATE_FILE"
-append_once "export EDA_HOME=\"$EDA_HOME\"" "$ACTIVATE_FILE"
-append_once "export PATH=\"$PREFIX/bin:\$PATH\"" "$ACTIVATE_FILE"
-append_once "export MAGIC_HOME=\"$PREFIX\"" "$ACTIVATE_FILE"
-[ "$HAVE_X11" -eq 1 ] && append_once 'export DISPLAY=${DISPLAY:-:0}' "$ACTIVATE_FILE"
-
-echo
-echo "[OK  ] Magic installed to: $PREFIX"
-echo "[OK  ] Environment updated: $ACTIVATE_FILE"
-cat <<'EOF'
-
-Use it now:
-  source ~/.eda/sky130/activate
-  magic             # GUI, if XQuartz is running
-# or headless:
-  magic -dnull -noconsole
-
-If you need XQuartz:
-  open -a XQuartz
-  xhost +localhost   # first time only
-  source ~/.eda/sky130/activate
-  DISPLAY=:0 magic &
+make_wrapper() {
+  ensure_dirs
+  cat >"$WRAPPER" <<EOF
+#!/usr/bin/env bash
+# Wrapper to run magic inside your sky130 environment
+set -euo pipefail
+if [ -f "$ACTIVATE_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$ACTIVATE_FILE"
+fi
+exec magic "\$@"
 EOF
+  chmod +x "$WRAPPER"
+  say "Installed wrapper: $WRAPPER"
+}
+
+install_via_macports() {
+  say "MacPorts detected — installing magic via MacPorts…"
+  # Update ports index
+  sudo port -N selfupdate
+  # Install magic with X11 support (variants names may vary; +x11 is default on macOS)
+  sudo port -N install magic +x11
+  local magic_bin="/opt/local/bin/magic"
+  [ -x "$magic_bin" ] || die "MacPorts magic not found at $magic_bin after install."
+
+  # Symlink to your toolchain bin for consistency
+  ensure_dirs
+  ln -sf "$magic_bin" "$BIN_DIR/magic"
+  say "Linked $magic_bin -> $BIN_DIR/magic"
+
+  make_wrapper
+  say "Done (MacPorts)."
+}
+
+install_via_brew_source() {
+  say "Falling back to Homebrew + source build…"
+  have brew || die "Homebrew not found. Install Homebrew or MacPorts."
+
+  # Ensure deps
+  brew update
+  # Tcl/Tk and XQuartz for X11 GUI
+  brew list --versions tcl-tk >/dev/null 2>&1 || brew install tcl-tk
+  # XQuartz is cask (installs under /opt/X11). It may prompt GUI installer the first time.
+  if ! [ -d "/opt/X11" ]; then
+    brew install --cask xquartz
+    say "XQuartz installed. You may need to log out/in once if X11 fails to start."
+  fi
+  brew list --versions git >/dev/null 2>&1 || brew install git
+  brew list --versions pkg-config >/dev/null 2>&1 || brew install pkg-config
+
+  # Paths for headers/libs
+  local HBTCL_H="/opt/homebrew/opt/tcl-tk/include"
+  local HBTCL_L="/opt/homebrew/opt/tcl-tk/lib"
+  local X11_H="/opt/X11/include"
+  local X11_L="/opt/X11/lib"
+
+  # Build workspace
+  local TMPROOT
+  TMPROOT="$(mktemp -d -t magic-src-XXXXXX)"
+  trap 'rm -rf "$TMPROOT"' EXIT
+
+  say "Cloning Magic tag $MAGIC_VER…"
+  git clone --depth 1 --branch "$MAGIC_VER" https://github.com/RTimothyEdwards/magic.git "$TMPROOT/magic"
+  cd "$TMPROOT/magic"
+
+  # Configure flags
+  export CPPFLAGS="${CPPFLAGS:-} -I$HBTCL_H -I$X11_H"
+  export LDFLAGS="${LDFLAGS:-} -L$HBTCL_L -L$X11_L"
+  export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}:$HBTCL_L/pkgconfig"
+
+  say "Configuring…"
+  ./configure \
+    --prefix="$PREFIX" \
+    --with-interpreter=tcl \
+    --enable-tcl=yes \
+    --enable-tk=yes \
+    --with-tcl="$HBTCL_L" \
+    --with-tk="$HBTCL_L" \
+    --x-includes="$X11_H" \
+    --x-libraries="$X11_L"
+
+  say "Building (make -j$MAKE_JOBS)…"
+  make -j"$MAKE_JOBS"
+
+  say "Installing to $PREFIX…"
+  make install
+
+  make_wrapper
+  say "Done (source build)."
+}
+
+ensure_env_note() {
+  # Suggest PATH export for the user environment file if needed
+  if [ -f "$ACTIVATE_FILE" ]; then
+    if ! grep -qs "$BIN_DIR" "$ACTIVATE_FILE"; then
+      cat >>"$ACTIVATE_FILE" <<EOF
+
+# Added by 20_magic.sh
+export PATH="$BIN_DIR:\$PATH"
+# If you need XQuartz DISPLAY, uncomment:
+# export DISPLAY=":0"
+EOF
+      say "Appended PATH to $ACTIVATE_FILE"
+    fi
+  else
+    say "Note: env file $ACTIVATE_FILE not found. Create it and add:"
+    echo "  export PATH=\"$BIN_DIR:\$PATH\""
+  fi
+}
+
+main() {
+  say "Installing Magic into: $PREFIX"
+  say "Using env file: $ACTIVATE_FILE"
+
+  if have port; then
+    install_via_macports
+  else
+    install_via_brew_source
+  fi
+
+  ensure_env_note
+
+  say "Verify with:  source \"$ACTIVATE_FILE\" && magic -version"
+}
+
+main "$@"
